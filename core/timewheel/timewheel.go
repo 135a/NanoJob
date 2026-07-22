@@ -7,20 +7,19 @@ import (
 
 // Task 代表挂载在时间轮上的一个定时任务
 type Task struct {
-	ID       string      // 任务的唯一标识
-	Execute  func()      // 任务触发时真正要执行的回调函数 (比如发送 HTTP 请求给 Java)
+	ID       string // 任务的唯一标识
+	Circle   int    // 重点：剩余的圈数
+	Execute  func() // 任务触发时真正要执行的回调函数
 }
 
-// TimeWheel 内存时间轮核心结构
 type TimeWheel struct {
-	interval time.Duration // 时钟滴答的间隔（例如 1 秒滴答一次）
-	ticker   *time.Ticker  // Go 标准库底层的硬件级定时器
-	slots    [][]*Task     // 环形数组：时间轮的每一个槽位 (里面存着待触发的任务列表)
-	current  int           // 当前指针指在哪个槽位
-	slotNum  int           // 槽位的总数量（例如 60 个槽代表一分钟）
-	
-	mutex    sync.RWMutex  // 互斥锁，保证并发添加任务时的内存安全
-	stopChan chan struct{} // 用于优雅停机的信号通道
+	interval time.Duration
+	ticker   *time.Ticker
+	slots    [][]*Task
+	current  int
+	slotNum  int
+	mutex    sync.RWMutex
+	stopChan chan struct{}
 }
 
 // New 实例化一个时间轮
@@ -37,15 +36,38 @@ func New(interval time.Duration, slotNum int) *TimeWheel {
 // Start 启动时间轮的心跳
 func (tw *TimeWheel) Start() {
 	tw.ticker = time.NewTicker(tw.interval)
-	go tw.run() // 开启一个 Goroutine 在后台静默运行
+	go tw.run()
 }
 
-// run 时间轮的死循环心脏（注意：这是纯内存运转，不查数据库）
+// AddTask 计算圈数和槽位，将任务插入时间轮
+func (tw *TimeWheel) AddTask(delay time.Duration, id string, execute func()) {
+	tw.mutex.Lock()
+	defer tw.mutex.Unlock()
+
+	// 1. 计算总共需要多少个“滴答”
+	ticks := int(delay / tw.interval)
+	
+	// 2. 计算需要转几圈
+	circle := ticks / tw.slotNum
+	
+	// 3. 计算应该落在哪一个槽位 (当前位置 + 余数)
+	pos := (tw.current + ticks) % tw.slotNum
+
+	// 4. 构建任务并放入对应的槽位
+	task := &Task{
+		ID:      id,
+		Circle:  circle,
+		Execute: execute,
+	}
+	tw.slots[pos] = append(tw.slots[pos], task)
+}
+
+// run 时间轮心脏
 func (tw *TimeWheel) run() {
 	for {
 		select {
 		case <-tw.ticker.C:
-			tw.tickHandler() // 每次滴答，指针往前走一格
+			tw.tickHandler()
 		case <-tw.stopChan:
 			tw.ticker.Stop()
 			return
@@ -53,20 +75,33 @@ func (tw *TimeWheel) run() {
 	}
 }
 
-// tickHandler 处理每一次指针的移动
 func (tw *TimeWheel) tickHandler() {
 	tw.mutex.Lock()
 	defer tw.mutex.Unlock()
 
-	// 1. 拿到当前指针槽位里的所有任务
 	tasks := tw.slots[tw.current]
-	
-	// 2. 遍历触发这些任务 (丢给其他的 Goroutine 异步执行，绝不阻塞当前时间轮指针)
+	var remainingTasks []*Task
+
+	// 遍历当前槽位的所有任务
 	for _, task := range tasks {
-		go task.Execute() 
+		if task.Circle > 0 {
+			// 如果圈数没走完，圈数减1，继续留在槽位里等待下一圈
+			task.Circle--
+			remainingTasks = append(remainingTasks, task)
+		} else {
+			// 如果圈数为 0，说明时间到了，立刻异步执行任务！
+			go task.Execute()
+		}
 	}
 
-	// 3. 清空当前槽位，并且指针往前走一格（取模实现环形运转）
-	tw.slots[tw.current] = make([]*Task, 0)
+	// 更新当前槽位（剔除掉已经执行的任务）
+	tw.slots[tw.current] = remainingTasks
+	
+	// 指针往前走一格
 	tw.current = (tw.current + 1) % tw.slotNum
+}
+
+// Stop 停止时间轮
+func (tw *TimeWheel) Stop() {
+	close(tw.stopChan)
 }
