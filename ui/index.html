@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NanoJob - 极简分布式调度控制台</title>
+    <!-- 引入现代化字体 Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            /* 极简高级暗黑模式配色 (类似 Vercel / Linear) */
+            --bg-base: #0f172a;
+            --bg-card: #1e293b;
+            --border-color: #334155;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --accent-blue: #38bdf8;
+            --accent-purple: #818cf8;
+            --accent-gradient: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            --success: #10b981;
+            --danger: #ef4444;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-base);
+            color: var(--text-main);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
+        }
+
+        /* 顶部导航栏 */
+        header {
+            border-bottom: 1px solid var(--border-color);
+            padding: 1.5rem 3rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(12px);
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .logo {
+            font-size: 1.5rem;
+            font-weight: 700;
+            background: var(--accent-gradient);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.5px;
+        }
+
+        /* 主容器 */
+        main {
+            padding: 3rem;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .header-actions {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-end;
+            margin-bottom: 2rem;
+        }
+
+        h1 {
+            font-size: 2rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+        }
+        
+        .subtitle {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+        }
+
+        /* 现代化按钮微交互 */
+        .btn-primary {
+            background: var(--accent-gradient);
+            color: #fff;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 14px rgba(56, 189, 248, 0.2);
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(56, 189, 248, 0.4);
+        }
+
+        /* 卡片与数据表格 */
+        .card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+
+        th {
+            background-color: rgba(15, 23, 42, 0.4);
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        td {
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border-color);
+            font-size: 0.95rem;
+            color: #e2e8f0;
+            transition: background 0.2s;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background-color: rgba(51, 65, 85, 0.4);
+        }
+
+        /* 状态呼吸灯特效 */
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--success);
+            margin-right: 8px;
+            box-shadow: 0 0 10px var(--success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+            70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+        }
+
+        /* 毛玻璃模态框 (Glassmorphism) */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(15, 23, 42, 0.7);
+            backdrop-filter: blur(8px);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.3s ease;
+            z-index: 100;
+        }
+
+        .modal-overlay.active {
+            opacity: 1;
+            pointer-events: all;
+        }
+
+        .modal {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            width: 450px;
+            padding: 2rem;
+            transform: translateY(20px) scale(0.95);
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .modal-overlay.active .modal {
+            transform: translateY(0) scale(1);
+        }
+
+        .modal h2 {
+            margin-bottom: 1.5rem;
+            font-size: 1.25rem;
+        }
+
+        /* 表单输入框现代化设计 */
+        .form-group {
+            margin-bottom: 1.25rem;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .form-group input, .form-group select {
+            width: 100%;
+            background: rgba(15, 23, 42, 0.5);
+            border: 1px solid var(--border-color);
+            color: #fff;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        .form-group input:focus, .form-group select:focus {
+            border-color: var(--accent-blue);
+            box-shadow: 0 0 0 1px var(--accent-blue);
+        }
+
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 1rem;
+            margin-top: 2rem;
+        }
+
+        .btn-cancel {
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border-color);
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .btn-cancel:hover {
+            background: rgba(255,255,255,0.05);
+            color: #fff;
+        }
+
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="logo">NanoJob Admin</div>
+        <div style="color: var(--text-muted); font-size: 0.9rem;">
+            <span class="status-dot"></span>引擎运行中 (Port: 8080)
+        </div>
+    </header>
+
+    <main>
+        <div class="header-actions">
+            <div>
+                <h1>任务大盘</h1>
+                <p class="subtitle">实时监控 etcd 分布式任务队列与内存时间轮状态</p>
+            </div>
+            <button class="btn-primary" onclick="openModal()">+ 新建定时任务</button>
+        </div>
+
+        <div class="card">
+            <table>
+                <thead>
+                    <tr>
+                        <th>任务 ID</th>
+                        <th>执行类名 (Handler)</th>
+                        <th>业务分组 (AppName)</th>
+                        <th>触发规则 (Cron)</th>
+                        <th>路由策略</th>
+                        <th>状态</th>
+                    </tr>
+                </thead>
+                <tbody id="jobTableBody">
+                    <!-- 数据将由 JS 动态渲染 -->
+                    <tr>
+                        <td colspan="6" style="text-align: center; color: var(--text-muted);">正在连接调度引擎...</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </main>
+
+    <!-- 新建任务弹窗 -->
+    <div class="modal-overlay" id="addModal">
+        <div class="modal">
+            <h2>配置新任务</h2>
+            <form id="jobForm">
+                <div class="form-group">
+                    <label>任务全局唯一 ID</label>
+                    <input type="text" id="jobId" placeholder="例如: loan-calc-job-1" required>
+                </div>
+                <div class="form-group">
+                    <label>Cron 表达式 (精确到秒)</label>
+                    <input type="text" id="jobCron" placeholder="例如: 0/10 * * * * ?" required>
+                </div>
+                <div class="form-group">
+                    <label>Java 执行器 Handler 名称</label>
+                    <input type="text" id="jobHandler" placeholder="例如: loanCreditJob" required>
+                </div>
+                <div class="form-group">
+                    <label>所属微服务 (AppName)</label>
+                    <input type="text" id="jobAppName" placeholder="例如: loan-service" required>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn-cancel" onclick="closeModal()">取消</button>
+                    <button type="submit" class="btn-primary">保存并热加载</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8080/api';
+
+        // 页面加载完毕即刻拉取数据
+        document.addEventListener('DOMContentLoaded', fetchJobs);
+
+        function openModal() {
+            document.getElementById('addModal').classList.add('active');
+        }
+
+        function closeModal() {
+            document.getElementById('addModal').classList.remove('active');
+            document.getElementById('jobForm').reset();
+        }
+
+        // 调用 Go 引擎获取任务列表
+        async function fetchJobs() {
+            try {
+                const response = await fetch(`${API_BASE}/job/list`);
+                const res = await response.json();
+                
+                const tbody = document.getElementById('jobTableBody');
+                tbody.innerHTML = ''; // 清空 loading
+
+                if (res.code === 200 && res.data) {
+                    if (res.data.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8">暂无任务，点击右上角新建</td></tr>';
+                        return;
+                    }
+                    
+                    res.data.forEach(job => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td style="font-weight: 500; color: #fff">${job.id}</td>
+                            <td style="color: var(--accent-blue)">@XxlJob("${job.executorHandler}")</td>
+                            <td><span style="background: rgba(129, 140, 248, 0.2); color: var(--accent-purple); padding: 4px 10px; border-radius: 20px; font-size: 0.8rem">${job.appName}</span></td>
+                            <td style="font-family: monospace; letter-spacing: 1px">${job.cron}</td>
+                            <td>${job.strategy}</td>
+                            <td><span class="status-dot"></span>倒计时中</td>
+                        `;
+                        tbody.appendChild(tr);
+                    });
+                }
+            } catch (error) {
+                console.error("请求失败", error);
+                document.getElementById('jobTableBody').innerHTML = 
+                    '<tr><td colspan="6" style="text-align:center;color:var(--danger)">无法连接到 Go 调度引擎，请确保 main.go 已在 8080 端口启动。</td></tr>';
+            }
+        }
+
+        // 提交表单添加新任务
+        document.getElementById('jobForm').addEventListener('submit', async (e) => {
+            e.preventDefault(); // 阻止页面刷新
+            
+            const payload = {
+                id: document.getElementById('jobId').value,
+                cron: document.getElementById('jobCron').value,
+                executorHandler: document.getElementById('jobHandler').value,
+                appName: document.getElementById('jobAppName').value,
+                strategy: "SHARDING" // 目前为了演示统一使用分片策略
+            };
+
+            const btn = e.target.querySelector('button[type="submit"]');
+            btn.textContent = '写入中...';
+            btn.disabled = true;
+
+            try {
+                const response = await fetch(`${API_BASE}/job/add`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const res = await response.json();
+                if (res.code === 200) {
+                    closeModal();
+                    fetchJobs(); // 刷新表格
+                    alert("任务创建成功！底层引擎已自动挂载到时间轮。请去 Go 控制台查看调度日志！");
+                } else {
+                    alert("报错了: " + res.msg);
+                }
+            } catch (error) {
+                alert("网络请求失败，检查 Go 引擎是否运行");
+            } finally {
+                btn.textContent = '保存并热加载';
+                btn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>
