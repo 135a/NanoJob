@@ -6,6 +6,8 @@ github.com/golang/protobuf v1.5.4 h1:i7eJL8qZTpSEXOPTxNKhASYpMn+8e5Q6AdndVa1dWek
 github.com/golang/protobuf v1.5.4/go.mod h1:lnTiLA8Wa4RWRcIUkrtSVa5nRhsEGBg48fD6rSs7xps=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
+github.com/robfig/cron/v3 v3.0.1 h1:WdRxkvbJztn8LMz/QEvLN5sBU+xKpSqwwUO1Pjr4qDs=
+github.com/robfig/cron/v3 v3.0.1/go.mod h1:eQICP3HwyT7UooqI/z+Ov+PtYAWygg1TEWWzGIFLtro=
 go.etcd.io/etcd/api/v3 v3.7.0 h1:WZlGK7pRtYGDB8ti8wkrQ5D2oWGMbtNL9VA5e+vF2Fg=
 go.etcd.io/etcd/api/v3 v3.7.0/go.mod h1:EcTihnwAQ0BQNh5dfAdaFVFdchuo7EP0HlX7TV3jz/A=
 go.etcd.io/etcd/client/pkg/v3 v3.7.0 h1:sW9njJzS3vXKcAJjjLQ4nk+avNUJ12Bcijcx8ehUskE=
