@@ -19,7 +19,7 @@ func main() {
 	job := &store.JobInfo{
 		ID:              "loan-job-999",
 		Cron:            "0/10 * * * * ?",
-		ExecutorHandler: "loanCreditJob",
+		ExecutorHandler: "loanInterestJobHandler", // 必须和 Java 里的 @XxlJob 名字一模一样
 		AppName:         "loan-service",
 		Strategy:        "SHARDING",
 	}
