@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: etcd
-        image: bitnami/etcd:3.5.9
+        image: bitnami/etcd:latest
         imagePullPolicy: IfNotPresent
         env:
         - name: ALLOW_NONE_AUTHENTICATION
