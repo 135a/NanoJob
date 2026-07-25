@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"nanojob/adapter/xxljob"
@@ -22,15 +24,21 @@ var (
 )
 
 func main() {
+	// 解析命令行启动参数
+	etcdAddr := flag.String("etcd", "127.0.0.1:2379", "etcd 节点地址，多个用逗号分隔 (例: 10.0.0.1:2379,10.0.0.2:2379)")
+	port := flag.String("port", "8080", "控制台及心跳接口的 HTTP 监听端口")
+	flag.Parse()
+
 	fmt.Println("========================================")
 	fmt.Println("🚀 NanoJob 企业级分布式调度引擎启动中...")
 	fmt.Println("========================================")
 
-	// 1. 初始化持久层 (连接本地的 etcd 集群)
+	// 1. 初始化持久层 (连接 etcd 集群)
 	var err error
-	etcdStore, err = store.NewEtcdStore([]string{"127.0.0.1:2379"})
+	endpoints := strings.Split(*etcdAddr, ",")
+	etcdStore, err = store.NewEtcdStore(endpoints)
 	if err != nil {
-		panic(fmt.Sprintf("致命错误：无法连接 etcd，请确认 etcd.exe 是否在运行！ %v", err))
+		panic(fmt.Sprintf("致命错误：无法连接 etcd 集群 [%s]！ %v", *etcdAddr, err))
 	}
 	fmt.Println("[1/5] etcd 云原生配置中心连接成功！")
 
@@ -70,8 +78,10 @@ func main() {
 
 	// 7. 启动 HTTP 监听，迎接 Java 兵团的注册
 	http.HandleFunc("/api/registry", registry.ReceiveHeartbeat)
-	fmt.Println("\n✅ NanoJob 启动完成！正在监听 :8080 端口，等待执行器接入...")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
+	
+	listenUrl := ":" + *port
+	fmt.Printf("\n✅ NanoJob 启动完成！正在监听 %s 端口，等待执行器接入...\n", listenUrl)
+	if err := http.ListenAndServe(listenUrl, nil); err != nil {
 		panic(err)
 	}
 }
