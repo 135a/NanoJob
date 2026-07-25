@@ -10,7 +10,7 @@ COPY src ./src
 RUN mvn clean package -DskipTests
 
 # 运行阶段：采用极简的 JRE 镜像，剥离源码和编译环境
-FROM openjdk:11-jre-slim
+FROM eclipse-temurin:11-jre-alpine
 WORKDIR /app
 COPY --from=builder /app/target/java-executor-1.0.0.jar app.jar
 

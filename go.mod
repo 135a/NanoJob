@@ -1,6 +1,6 @@
 module nanojob
 
-go 1.26.4
+go 1.20
 
 require (
 	github.com/coreos/go-semver v0.3.1 // indirect
