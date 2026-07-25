@@ -29,7 +29,8 @@ go.work.sum
 .DS_Store
 
 # Project specific
-nanojob
+/nanojob
+nanojob.exe
 data/
 logs/
 docs/
