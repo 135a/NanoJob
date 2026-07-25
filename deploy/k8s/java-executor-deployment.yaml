@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
       - name: java-executor
-        image: nanojob/java-executor:v1.0
+        image: nanojob/java-executor:v1.1
         imagePullPolicy: IfNotPresent
         # 【架构精髓】：跨语言微服务在 K8s 中的内网通信
         # 这里注入环境变量，覆盖 application.yml 中的默认配置。

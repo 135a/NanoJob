@@ -1,11 +1,11 @@
 Write-Host "🚀 开始一键构建并部署 NanoJob K8s 集群..." -ForegroundColor Green
 
 Write-Host "`n[1/3] 构建 Go 引擎控制面镜像..." -ForegroundColor Cyan
-docker build -t nanojob/engine:v1.0 .
+docker build -t nanojob/engine:v1.3 .
 
 Write-Host "`n[2/3] 构建 Java 兵团数据面镜像..." -ForegroundColor Cyan
 Push-Location examples/java-executor
-docker build -t nanojob/java-executor:v1.0 .
+docker build -t nanojob/java-executor:v1.1 .
 Pop-Location
 
 Write-Host "`n[3/3] 向 K8s 下达全量部署指令..." -ForegroundColor Cyan

@@ -128,6 +128,7 @@ func scheduleJob(job *store.JobInfo) {
 					req := &xxljob.RunReq{
 						JobID:           10086,
 						ExecutorHandler: job.ExecutorHandler,
+						GlueType:        "BEAN",
 						BroadcastIndex:  s.BroadcastIndex,
 						BroadcastTotal:  s.BroadcastTotal,
 					}

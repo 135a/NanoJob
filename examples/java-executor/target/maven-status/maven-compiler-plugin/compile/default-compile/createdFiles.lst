@@ -1,0 +1,3 @@
+com\nanojob\demo\config\XxlJobConfig.class
+com\nanojob\demo\job\MockJobs.class
+com\nanojob\demo\ExecutorApplication.class

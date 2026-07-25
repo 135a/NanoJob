@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -38,7 +39,12 @@ var httpClient = &http.Client{
 // Trigger 向远程 Java 执行器发送触发指令
 func Trigger(targetIP string, req *RunReq) error {
 	// 1. 组装目标 URL (XXL-Job 执行器默认的触发路径是 /run)
-	targetURL := fmt.Sprintf("http://%s/run", targetIP)
+	// 注意：Java 注册过来的 targetIP 实际上是完整地址 (例: http://10.0.0.1:9999/)
+	targetURL := targetIP
+	if !strings.HasSuffix(targetURL, "/") {
+		targetURL += "/"
+	}
+	targetURL += "run"
 
 	// 2. 将我们的结构体转化为 JSON 字节流
 	reqBytes, err := json.Marshal(req)
