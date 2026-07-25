@@ -50,6 +50,11 @@ func main() {
 	registry.StartMonitor()
 	fmt.Println("[3/5] Registry 心跳清道夫启动成功！")
 
+	// TODO: [架构缺陷 1] 缺乏分布式抢锁选主 (Leader Election)
+	// 警告：在 K8s 中部署 3 台引擎时，为了防止 3 台引擎同时启动时间轮导致任务重复下发 3 次，
+	// 必须在此处引入 etcd 的 Concurrency 包。3 台机器去争抢同一把分布式锁 (Lease)，
+	// 只有抢到锁的 Leader 机器，才能执行下方的 tw.Start() 并派发任务。
+
 	// 4. 启动内存时间轮
 	tw = timewheel.New(1*time.Second, 60)
 	tw.Start()
@@ -64,6 +69,9 @@ func main() {
 	} else {
 		fmt.Printf("[5/5] 从 etcd 成功恢复了 %d 个历史任务，开始挂载...\n", len(jobs))
 		for _, job := range jobs {
+			// TODO: [架构缺陷 2] 漏发补偿 (Misfire)
+			// 如果引擎曾发生宕机，在此处从 etcd 恢复任务时，应当对比 job.LastTriggerTime 与当前时间。
+			// 如果发现因为宕机错过了本该执行的周期，应立即触发一次强制补偿执行，然后再挂入下方的 scheduleJob。
 			scheduleJob(job) // 核心：将任务挂载到时间轮
 		}
 	}
@@ -77,6 +85,12 @@ func main() {
 	jobApi.RegisterRoutes()
 
 	// 7. 启动 HTTP 监听，迎接 Java 兵团的注册
+	// TODO: [架构缺陷 3] 接口缺乏安全鉴权 (API Auth)
+	// 当前所有 /api 接口均在公网/内网裸奔，极度危险。应当在此处加入 HTTP Middleware (拦截器) 校验安全 Token。
+	
+	// TODO: [架构缺陷 4] 缺乏执行结果的闭环回调与日志 (Callback & Logging)
+	// 当前引擎发包后(fire-and-forget)无法得知 Java 任务的最终成功/失败状态。
+	// 需要新增类似 /api/callback 的接口供 Java 机器打完仗后上报战况，并持久化日志至 MySQL/ES 以供前端页面展示。
 	http.HandleFunc("/api/registry", registry.ReceiveHeartbeat)
 	
 	listenUrl := ":" + *port
