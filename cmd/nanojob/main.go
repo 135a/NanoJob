@@ -50,10 +50,12 @@ func main() {
 	registry.StartMonitor()
 	fmt.Println("[3/5] Registry 心跳清道夫启动成功！")
 
-	// TODO: [架构缺陷 1] 缺乏分布式抢锁选主 (Leader Election)
-	// 警告：在 K8s 中部署 3 台引擎时，为了防止 3 台引擎同时启动时间轮导致任务重复下发 3 次，
-	// 必须在此处引入 etcd 的 Concurrency 包。3 台机器去争抢同一把分布式锁 (Lease)，
-	// 只有抢到锁的 Leader 机器，才能执行下方的 tw.Start() 并派发任务。
+	// TODO: [架构缺陷 1] 控制面脑裂与分布式选主 (Control Plane Split-Brain & Leader Election)
+	// 致命警告：当前代码中所有的 Go 引擎在启动后，都会毫无顾忌地直接启动下方的时间轮并去 etcd 拉取任务！
+	// 当 K8s 部署 3 台引擎时，这 3 台引擎会发生严重的“脑裂”，同时向 Java 机器派发任务，导致任务被重复执行 3 次，引发灾难！
+	// 修复方案：必须在此处引入 etcd 的 concurrency.NewMutex() 实现选主。
+	// 3 台机器共同去争抢同一把分布式锁，只有抢到锁的唯一一台机器（Leader）才有资格执行下方的 tw.Start() 并派发任务。
+	// 其余未抢到锁的机器必须在此处阻塞等待，作为高可用替补（Standby）。
 
 	// 4. 启动内存时间轮
 	tw = timewheel.New(1*time.Second, 60)
