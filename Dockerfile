@@ -1,5 +1,5 @@
 # 编译阶段：利用官方 Go 镜像进行源码编译
-FROM golang:1.20 AS builder
+FROM golang:alpine AS builder
 WORKDIR /app
 COPY . .
 # 禁用 CGO 并编译为完全静态链接的 Linux 二进制文件
