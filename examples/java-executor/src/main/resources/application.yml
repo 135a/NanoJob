@@ -1,0 +1,12 @@
+server:
+  port: 8081 # Java 机器自己的 Web 端口
+
+xxl:
+  job:
+    admin:
+      # 【核心灵魂】：将原来的 Java 调度中心，替换为咱们用 Go 写的 NanoJob 引擎地址！
+      addresses: http://127.0.0.1:8080 
+    executor:
+      appname: loan-service # 业务组名，必须与 Go 引擎后台配置的一致
+      port: 9999 # XXL-Job 内置 Netty 监听端口，用于接收 Go 发来的任务触发指令
+      logpath: ./logs/xxl-job/jobhandler
