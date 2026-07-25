@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: java-executor
+  namespace: default
+  labels:
+    app: java-executor
+spec:
+  # 部署 2 台 Java 机器，完美演示 NanoJob 的动态分片(Sharding)广播能力
+  replicas: 2
+  selector:
+    matchLabels:
+      app: java-executor
+  template:
+    metadata:
+      labels:
+        app: java-executor
+    spec:
+      containers:
+      - name: java-executor
+        image: nanojob/java-executor:v1.0
+        imagePullPolicy: IfNotPresent
+        # 【架构精髓】：跨语言微服务在 K8s 中的内网通信
+        # 这里注入环境变量，覆盖 application.yml 中的默认配置。
+        # 目标指向咱们 Go 引擎在 K8s 内部的 Service 名称 (nanojob-service，端口 80)
+        env:
+        - name: XXL_JOB_ADMIN_ADDRESSES
+          value: "http://nanojob-service:80"
+        ports:
+        - containerPort: 8081
+        - containerPort: 9999
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
