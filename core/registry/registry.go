@@ -13,6 +13,21 @@ type AppRegistry struct {
 	nodes map[string]time.Time // IP -> 最后一次心跳时间
 }
 
+// TODO: [架构缺陷 5] 状态孤岛问题 (Stateful Registry)
+// 致命 Bug 预警：当前心跳注册表 globalRegistry 是纯内存 Map！
+// 当 K8s 部署多台 Go 引擎时，负载均衡会导致各个 Go 引擎只收到部分 Java 节点的心跳。
+// 结果：在分片广播模式下，每台 Go 引擎只会把任务下发给它自认为活着的节点，导致严重的分片不均，
+// 甚至结合缺乏选主的 Bug，会造成多个节点重复全量执行业务，引发严重的数据灾难！
+//
+// [终极解决方案]：全面拥抱 etcd (待未来重构)
+// 1. 服务发现 (Service Discovery)：废弃内存 Map，Go 引擎收到心跳后直接写入 etcd 并绑定 90 秒 Lease（租约）。
+//    - Key 格式：/nanojob/registry/{appname}/{ip:port}
+//    - etcd 将自动利用 Lease TTL 处理节点的过期剔除，彻底干掉手写的 Monitor 轮询。
+//    - 派发任务时，Go 引擎实时向 etcd 发起 Prefix 查询，确保任何一台引擎拿到的分片名单都是 100% 全局一致的！
+// 2. 分布式抢锁选主 (Leader Election)：使用 etcd 的 concurrency.NewMutex()。
+//    - 只有抢到锁的 Go 引擎（Leader）才有资格转动 TimeWheel 派发任务。
+//    - 另外两台 Go 引擎作为 Standby。一旦 Leader 宕机，租约失效，立刻会有新的 Standby 抢锁上位，实现无缝故障转移！
+
 var (
 	// 全局注册表: AppName -> AppRegistry
 	globalRegistry = make(map[string]*AppRegistry)
