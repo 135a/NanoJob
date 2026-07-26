@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
       - name: engine
-        image: nanojob/engine:v1.7
+        image: nanojob/engine:v1.8
         imagePullPolicy: IfNotPresent
         # 【架构精髓】：通过命令行参数传入 K8s 内部域名，而非硬编码 IP。
         # K8s 的 CoreDNS 会自动将 etcd-service 解析到真实的 etcd Pod，并在宕机时毫秒级更新路由。

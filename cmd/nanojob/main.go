@@ -134,8 +134,49 @@ func main() {
 	}
 }
 
+// fireOnce 纯粹的派发逻辑，打完仗就撤，绝不自循环（供正常触发和 Misfire 补偿复用）
+func fireOnce(job *store.JobInfo) {
+	fmt.Printf("\n[%s] ⚡ 任务触发！开始派发 -> %s\n", time.Now().Format("15:04:05"), job.ID)
+
+	aliveNodes := registry.GetAliveNodes(job.AppName)
+	if len(aliveNodes) == 0 {
+		fmt.Printf("   -> 警告：业务组 [%s] 下没有活着的 Java 机器，任务只能跳过。\n", job.AppName)
+		return
+	}
+	
+	shardResults, _ := router.Route(router.StrategySharding, aliveNodes)
+
+	for _, shard := range shardResults {
+		go func(s router.ShardResult) {
+			req := &xxljob.RunReq{
+				JobID:           10086,
+				ExecutorHandler: job.ExecutorHandler,
+				GlueType:        "BEAN",
+				BroadcastIndex:  s.BroadcastIndex,
+				BroadcastTotal:  s.BroadcastTotal,
+			}
+			if err := xxljob.Trigger(s.TargetIP, req); err != nil {
+				fmt.Printf("   -> 派发失败 (%s): %v\n", s.TargetIP, err)
+			} else {
+				fmt.Printf("   -> 🚀 成功击中目标 %s (分片 %d/%d)\n", s.TargetIP, s.BroadcastIndex, s.BroadcastTotal)
+			}
+		}(shard)
+	}
+}
+
 // scheduleJob 核心魔法：算时间、塞入轮子、自动循环
 func scheduleJob(job *store.JobInfo) {
+	now := time.Now().Unix()
+
+	// ⭐️ Misfire 漏发补偿机制 ⭐️
+	// 如果配置里存在预期的执行时间，而且当前时间已经超过了预期时间 (给 5 秒网络宽限期)
+	if job.NextTriggerTime > 0 && job.NextTriggerTime < now-5 {
+		fmt.Printf("\n[Misfire 预警] 发现任务 %s 在宕机期间漏发！立即触发 [FIRE_ONCE_NOW] 补偿机制！\n", job.ID)
+		
+		// 独立开一个协程，立刻把漏掉的任务补发出去！(纯派发，不干扰后续正常的调度循环)
+		go fireOnce(job)
+	}
+
 	// A. 翻译官出马：算一下距离下一次执行还有多少秒
 	delay, err := cronParser.NextDelay(job.Cron)
 	if err != nil {
@@ -143,46 +184,17 @@ func scheduleJob(job *store.JobInfo) {
 		return
 	}
 
+	// ⭐️ 持久化记忆 ⭐️
+	// 算出下一次真实的绝对时间戳，并异步写回 etcd！这样哪怕下一秒断电，系统也有记忆！
+	job.NextTriggerTime = time.Now().Add(delay).Unix()
+	go etcdStore.SaveJob(context.Background(), job)
+
 	// B. 定义这个任务“到点后真正要干的活”
 	var triggerFunc func()
 	triggerFunc = func() {
-		fmt.Printf("\n[%s] ⚡ 任务触发！开始派发 -> %s\n", time.Now().Format("15:04:05"), job.ID)
-
-		// B1. 去注册中心查人
-		aliveNodes := registry.GetAliveNodes(job.AppName)
-		if len(aliveNodes) == 0 {
-			fmt.Printf("   -> 警告：业务组 [%s] 下没有活着的 Java 机器，任务只能跳过。\n", job.AppName)
-		} else {
-			// B2. 路由分片
-			shardResults, _ := router.Route(router.StrategySharding, aliveNodes)
-
-			// B3. 并发开火射击！
-			for _, shard := range shardResults {
-				go func(s router.ShardResult) {
-					req := &xxljob.RunReq{
-						JobID:           10086,
-						ExecutorHandler: job.ExecutorHandler,
-						GlueType:        "BEAN",
-						BroadcastIndex:  s.BroadcastIndex,
-						BroadcastTotal:  s.BroadcastTotal,
-					}
-					if err := xxljob.Trigger(s.TargetIP, req); err != nil {
-						fmt.Printf("   -> 派发失败 (%s): %v\n", s.TargetIP, err)
-						
-						// TODO: [Phase 5 进阶容灾] 增加故障转移 (Failover) 逻辑
-						// 如果在发包过程中机器突然宕机导致 Trigger 失败：
-						// 1. 需要立刻从 aliveNodes 缓存中剔除当前死掉的 s.TargetIP。
-						// 2. 从剩余存活机器中重新挑选一台 Backup Node。
-						// 3. 将当前的 req (携带相同分片 Index) 重新发送给备用机器。
-						// ⚠️ 警告：实现此功能前，务必保证下游 Java 端的 @XxlJob 业务逻辑实现了绝对的【幂等性】，否则会引发重复扣款灾难。
-					} else {
-						fmt.Printf("   -> 🚀 成功击中目标 %s (分片 %d/%d)\n", s.TargetIP, s.BroadcastIndex, s.BroadcastTotal)
-					}
-				}(shard)
-			}
-		}
-
-		// B4. 灵魂自循环：任务执行完后，再调一次自己，去算下下一次的时间，重新排队！
+		// 1. 打仗
+		fireOnce(job)
+		// 2. 灵魂自循环：重新排队！
 		scheduleJob(job)
 	}
 
