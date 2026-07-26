@@ -2,8 +2,9 @@
 FROM golang:alpine AS builder
 WORKDIR /app
 COPY . .
-# 禁用 CGO 并编译为完全静态链接的 Linux 二进制文件
-RUN CGO_ENABLED=0 GOOS=linux go build -o nanojob ./cmd/nanojob/main.go
+# 设置国内代理并禁用 CGO，编译为静态链接文件
+RUN go env -w GOPROXY=https://goproxy.cn,direct && \
+    CGO_ENABLED=0 GOOS=linux go build -o nanojob ./cmd/nanojob/main.go
 
 # 运行阶段：采用极简的 alpine 镜像，剥离编译环境，使得最终镜像体积通常小于 20MB
 FROM alpine:latest

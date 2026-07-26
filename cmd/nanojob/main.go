@@ -5,8 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
+
+	"go.etcd.io/etcd/client/v3/concurrency"
 
 	"nanojob/adapter/xxljob"
 	"nanojob/api"
@@ -50,33 +53,62 @@ func main() {
 	registry.StartMonitor()
 	fmt.Println("[3/5] Registry 心跳清道夫启动成功！")
 
-	// TODO: [架构缺陷 1] 控制面脑裂与分布式选主 (Control Plane Split-Brain & Leader Election)
-	// 致命警告：当前代码中所有的 Go 引擎在启动后，都会毫无顾忌地直接启动下方的时间轮并去 etcd 拉取任务！
-	// 当 K8s 部署 3 台引擎时，这 3 台引擎会发生严重的“脑裂”，同时向 Java 机器派发任务，导致任务被重复执行 3 次，引发灾难！
-	// 修复方案：必须在此处引入 etcd 的 concurrency.NewMutex() 实现选主。
-	// 3 台机器共同去争抢同一把分布式锁，只有抢到锁的唯一一台机器（Leader）才有资格执行下方的 tw.Start() 并派发任务。
-	// 其余未抢到锁的机器必须在此处阻塞等待，作为高可用替补（Standby）。
-
-	// 4. 启动内存时间轮
+	// 4. 初始化内存时间轮 (先初始化防止 API 调用报空指针)
 	tw = timewheel.New(1*time.Second, 60)
-	tw.Start()
-	fmt.Println("[4/5] TimeWheel 核心引擎点火成功，开始静默跳动...")
 
-	// 5. 【高能预警】：引擎重启恢复！从 etcd 捞出所有存量任务
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	jobs, err := etcdStore.ListJobs(ctx)
-	if err != nil {
-		fmt.Printf("警告：从 etcd 拉取任务失败: %v\n", err)
-	} else {
-		fmt.Printf("[5/5] 从 etcd 成功恢复了 %d 个历史任务，开始挂载...\n", len(jobs))
-		for _, job := range jobs {
-			// TODO: [架构缺陷 2] 漏发补偿 (Misfire)
-			// 如果引擎曾发生宕机，在此处从 etcd 恢复任务时，应当对比 job.LastTriggerTime 与当前时间。
-			// 如果发现因为宕机错过了本该执行的周期，应立即触发一次强制补偿执行，然后再挂入下方的 scheduleJob。
-			scheduleJob(job) // 核心：将任务挂载到时间轮
+	// 5. [架构重构] 控制面脑裂与分布式选主 (Control Plane Split-Brain & Leader Election)
+	// ⚠️ 必须把竞选逻辑放入后台协程，绝对不能阻塞主线程启动 HTTP Server，否则 Standby 节点将无法接收心跳！
+	go func() {
+		fmt.Println("\n[4/5] 🛡️ 正在进行全局 Leader 竞选，后台阻塞等待上位...")
+		
+		// 创建 5秒 租约 (TTL=5)
+		session, err := concurrency.NewSession(etcdStore.GetClient(), concurrency.WithTTL(5))
+		if err != nil {
+			fmt.Printf("创建 etcd Session 失败: %v\n", err)
+			return
 		}
-	}
+		defer session.Close()
+
+		// 创建名为 "/nanojob/election" 的竞选房间
+		election := concurrency.NewElection(session, "/nanojob/election")
+
+		// 获取本机Hostname作为节点标识
+		hostname, _ := os.Hostname()
+		nodeID := fmt.Sprintf("engine-%s", hostname)
+
+		// 开始抢锁！此方法会 阻塞，直到抢到锁为止。未抢到锁的机器将在此永久待命 (Standby)。
+		if err := election.Campaign(context.Background(), nodeID); err != nil {
+			fmt.Printf("竞选 Leader 失败退出: %v\n", err)
+			return
+		}
+
+		// =========================================================
+		// ⚠️ 只有成功当选为 Leader 的机器，代码才会继续往下执行！ ⚠️
+		// =========================================================
+		fmt.Printf("🔥 竞选成功！当前节点 [%s] 已接管整个集群调度大权！\n\n", nodeID)
+
+		// 启动内存时间轮 (仅 Leader 运行)
+		tw.Start()
+		fmt.Println("[5/5] TimeWheel 核心引擎点火成功，开始静默跳动...")
+
+		// 引擎重启恢复！从 etcd 捞出所有存量任务 (仅 Leader 运行)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		jobs, err := etcdStore.ListJobs(ctx)
+		if err != nil {
+			fmt.Printf("警告：从 etcd 拉取任务失败: %v\n", err)
+		} else {
+			fmt.Printf("      -> 从 etcd 成功恢复了 %d 个历史任务，开始挂载...\n", len(jobs))
+			for _, job := range jobs {
+				scheduleJob(job)
+			}
+		}
+
+		// ⚠️ 极其关键的一步：阻塞当前协程，绝不能让它退出！
+		// 如果协程退出，defer session.Close() 就会被执行，etcd 租约会被撤销。
+		// 这会导致其他替补节点立刻抢到锁，从而引发所有节点都变成 Leader 的超级脑裂灾难！
+		select {}
+	}()
 
 	// 6. 注册管理后台 API (提供给可视化网页调用)
 	jobApi := &api.JobAPI{

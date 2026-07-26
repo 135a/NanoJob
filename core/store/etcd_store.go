@@ -31,6 +31,11 @@ func NewEtcdStore(endpoints []string) (*EtcdStore, error) {
 	}, nil
 }
 
+// GetClient 暴露底层的 etcd 客户端，供分布式锁(Leader Election)使用
+func (s *EtcdStore) GetClient() *clientv3.Client {
+	return s.client
+}
+
 // SaveJob 把任务装换成 JSON 存入 etcd
 func (s *EtcdStore) SaveJob(ctx context.Context, job *JobInfo) error {
 	key := s.prefix + job.ID
