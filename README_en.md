@@ -47,7 +47,13 @@ In massive data processing scenarios (e.g., millions of overnight interest calcu
 1. **Dynamic Sharding (MapReduce-like)**
    When a job is triggered, the engine does not blindly dump millions of records onto a single machine. It dynamically senses the total number of alive Java nodes in the cluster. Using a **Broadcast + Modulo algorithm**, it dispatches unique `Index` parameters to each node. Compute power scales infinitely as you add more machines!
 2. **K8s Decoupling & Injection**
-   Fully embraces Infrastructure as Code (IaC). NanoJob avoids hardcoded configs, exposing parameters via CLI flags. In K8s, CoreDNS domains are injected via YAML args, allowing operators to hot-switch etcd IPs or listening ports without rebuilding code. 
+   Fully embraces Infrastructure as Code (IaC). NanoJob avoids hardcoded configs, exposing parameters via CLI flags. In K8s, CoreDNS domains are injected via YAML args, allowing operators to hot-switch etcd IPs or listening ports without rebuilding code.
+3. **High Availability & Split-Brain Defense**
+   Powered by etcd's `concurrency.NewElection`, NanoJob guarantees strict Leader-Follower consistency. Even if deployed with 10 K8s replicas, only 1 Leader commands the TimeWheel. Severe network partitions will automatically trigger safe failovers, strictly preventing duplicate job execution (Split-Brain).
+4. **Stateless Dynamic Registry**
+   Completely eliminated legacy in-memory `sync.Map` islands. Executor heartbeats are directly bound to etcd **Leases**. If a node dies, etcd auto-expires its lease globally. The Leader accesses a real-time, globally consistent view before every dispatch, guaranteeing 100% accurate sharding routing.
+5. **Misfire Compensation Strategy**
+   Zero tolerance for business data loss during power outages. When the NanoJob cluster recovers from total downtime, the newly elected Leader automatically audits the database. Any severely delayed critical tasks are instantly salvaged via a forced `FIRE_ONCE_NOW` compensation before resuming normal TimeWheel cadence.
 
 ---
 
