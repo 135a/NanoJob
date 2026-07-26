@@ -49,9 +49,9 @@ func main() {
 	cronParser = parser.NewCronParser()
 	fmt.Println("[2/5] Cron 翻译官已就位，支持 Spring 6位秒级语法！")
 
-	// 3. 启动后台清道夫 (清理失联机器)
-	registry.StartMonitor()
-	fmt.Println("[3/5] Registry 心跳清道夫启动成功！")
+	// 3. 初始化无状态注册表 (注入 etcd 客户端)
+	registry.Init(etcdStore.GetClient())
+	fmt.Println("[3/5] 基于 etcd Lease 的无状态 Registry 启动成功！")
 
 	// 4. 初始化内存时间轮 (先初始化防止 API 调用报空指针)
 	tw = timewheel.New(1*time.Second, 60)

@@ -1,38 +1,22 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
-	"sync"
+	"strings"
 	"time"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-// AppRegistry 存储某一个应用（如 loan-service）下面所有存活的节点 IP
-type AppRegistry struct {
-	mu    sync.RWMutex
-	nodes map[string]time.Time // IP -> 最后一次心跳时间
+var etcdClient *clientv3.Client
+
+// Init 注入 etcd 客户端
+func Init(client *clientv3.Client) {
+	etcdClient = client
 }
-
-// TODO: [架构缺陷 5] 状态孤岛问题 (Stateful Registry)
-// 致命 Bug 预警：当前心跳注册表 globalRegistry 是纯内存 Map！
-// 当 K8s 部署多台 Go 引擎时，负载均衡会导致各个 Go 引擎只收到部分 Java 节点的心跳。
-// 结果：在分片广播模式下，每台 Go 引擎只会把任务下发给它自认为活着的节点，导致严重的分片不均，
-// 甚至结合缺乏选主的 Bug，会造成多个节点重复全量执行业务，引发严重的数据灾难！
-//
-// [终极解决方案]：全面拥抱 etcd (待未来重构)
-// 1. 服务发现 (Service Discovery)：废弃内存 Map，Go 引擎收到心跳后直接写入 etcd 并绑定 90 秒 Lease（租约）。
-//    - Key 格式：/nanojob/registry/{appname}/{ip:port}
-//    - etcd 将自动利用 Lease TTL 处理节点的过期剔除，彻底干掉手写的 Monitor 轮询。
-//    - 派发任务时，Go 引擎实时向 etcd 发起 Prefix 查询，确保任何一台引擎拿到的分片名单都是 100% 全局一致的！
-// 2. 分布式抢锁选主 (Leader Election)：使用 etcd 的 concurrency.NewMutex()。
-//    - 只有抢到锁的 Go 引擎（Leader）才有资格转动 TimeWheel 派发任务。
-//    - 另外两台 Go 引擎作为 Standby。一旦 Leader 宕机，租约失效，立刻会有新的 Standby 抢锁上位，实现无缝故障转移！
-
-var (
-	// 全局注册表: AppName -> AppRegistry
-	globalRegistry = make(map[string]*AppRegistry)
-	registryMutex  sync.RWMutex
-)
 
 // RegistryParam XXL-Job 客户端心跳上报的 JSON 请求格式
 type RegistryParam struct {
@@ -49,21 +33,33 @@ func ReceiveHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	registryMutex.Lock()
-	appReg, exists := globalRegistry[param.RegistryKey]
-	if !exists {
-		// 如果这个应用是第一次来注册，帮它建一个专属名单库
-		appReg = &AppRegistry{
-			nodes: make(map[string]time.Time),
-		}
-		globalRegistry[param.RegistryKey] = appReg
+	if etcdClient == nil {
+		http.Error(w, "etcd 尚未初始化", http.StatusInternalServerError)
+		return
 	}
-	registryMutex.Unlock()
 
-	// 核心操作：更新这台机器的【最后存活时间】为当前时刻
-	appReg.mu.Lock()
-	appReg.nodes[param.RegistryValue] = time.Now()
-	appReg.mu.Unlock()
+	// 核心改造：将心跳写入 etcd，并绑定 90 秒租约
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// 1. 申请一个 90 秒的租约 (如果机器挂了，90秒后 etcd 会自动删掉它的记录)
+	lease, err := etcdClient.Grant(ctx, 90)
+	if err != nil {
+		fmt.Printf("心跳租约申请失败: %v\n", err)
+		http.Error(w, "底层 etcd 错误", http.StatusInternalServerError)
+		return
+	}
+
+	// 2. 写入键值对，Key 格式为: /nanojob/registry/{appName}/{ip}
+	key := fmt.Sprintf("/nanojob/registry/%s/%s", param.RegistryKey, param.RegistryValue)
+	
+	// 3. 把 Key 和 租约 绑定起来
+	_, err = etcdClient.Put(ctx, key, "", clientv3.WithLease(lease.ID))
+	if err != nil {
+		fmt.Printf("心跳写入 etcd 失败: %v\n", err)
+		http.Error(w, "底层 etcd 错误", http.StatusInternalServerError)
+		return
+	}
 
 	// 按 XXL-Job 协议返回 200 OK
 	w.Header().Set("Content-Type", "application/json")
@@ -72,45 +68,31 @@ func ReceiveHeartbeat(w http.ResponseWriter, r *http.Request) {
 
 // GetAliveNodes （供我们的 Router 调用）获取某个应用下当前活着的所有节点 IP
 func GetAliveNodes(appname string) []string {
-	registryMutex.RLock()
-	appReg, exists := globalRegistry[appname]
-	registryMutex.RUnlock()
+	if etcdClient == nil {
+		return nil
+	}
 
-	if !exists {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// 查询前缀为 /nanojob/registry/{appName}/ 的所有存活节点
+	prefix := fmt.Sprintf("/nanojob/registry/%s/", appname)
+	resp, err := etcdClient.Get(ctx, prefix, clientv3.WithPrefix())
+	if err != nil {
+		fmt.Printf("查询 etcd 注册表失败: %v\n", err)
 		return nil
 	}
 
 	var aliveNodes []string
-	appReg.mu.RLock()
-	for ip, lastBeat := range appReg.nodes {
-		// 防御性判断：如果距离上次心跳没有超过 90 秒，认为它是活的
-		if time.Since(lastBeat) < 90*time.Second {
+	for _, kv := range resp.Kvs {
+		keyStr := string(kv.Key)
+		// 严谨改造：XXL-Job 上报的可能是 "http://10.244.0.4:9999/"，里面自带斜杠
+		// 所以绝对不能用 strings.Split，必须用 TrimPrefix 原汁原味地截取出来！
+		ip := strings.TrimPrefix(keyStr, prefix)
+		if ip != "" {
 			aliveNodes = append(aliveNodes, ip)
 		}
 	}
-	appReg.mu.RUnlock()
 
 	return aliveNodes
-}
-
-// StartMonitor 启动后台清道夫（定期把掉线的节点彻底从 map 里踢掉，防止内存泄漏）
-func StartMonitor() {
-	go func() {
-		for {
-			time.Sleep(30 * time.Second) // 每 30 秒巡逻一次
-			
-			registryMutex.RLock()
-			for _, appReg := range globalRegistry {
-				appReg.mu.Lock()
-				for ip, lastBeat := range appReg.nodes {
-					if time.Since(lastBeat) > 90*time.Second {
-						// 超过 90 秒没心跳，说明机器宕机，无情踢出名单
-						delete(appReg.nodes, ip) 
-					}
-				}
-				appReg.mu.Unlock()
-			}
-			registryMutex.RUnlock()
-		}
-	}()
 }
