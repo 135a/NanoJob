@@ -301,10 +301,6 @@
             <h2>配置新任务</h2>
             <form id="jobForm">
                 <div class="form-group">
-                    <label>任务全局唯一 ID</label>
-                    <input type="text" id="jobId" placeholder="例如: loan-calc-job-1" required>
-                </div>
-                <div class="form-group">
                     <label>Cron 表达式 (精确到秒)</label>
                     <input type="text" id="jobCron" placeholder="例如: 0/10 * * * * ?" required>
                 </div>
@@ -379,7 +375,7 @@
             e.preventDefault(); // 阻止页面刷新
             
             const payload = {
-                id: document.getElementById('jobId').value,
+                // ID 不再由前端输入，而是由后端雪花算法自动生成
                 cron: document.getElementById('jobCron').value,
                 executorHandler: document.getElementById('jobHandler').value,
                 appName: document.getElementById('jobAppName').value,

@@ -6,8 +6,20 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/bwmarrin/snowflake"
 	"nanojob/core/store"
 )
+
+var sfNode *snowflake.Node
+
+func init() {
+	var err error
+	// 初始化雪花算法节点，这里的 1 是机器 ID。生产环境中不同机器应该配置不同的 ID。
+	sfNode, err = snowflake.NewNode(1)
+	if err != nil {
+		panic("初始化雪花算法失败: " + err.Error())
+	}
+}
 
 // JobAPI 封装了对外暴露的管理端接口
 type JobAPI struct {
@@ -67,9 +79,13 @@ func (api *JobAPI) AddJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 基础参数防呆校验
-	if job.ID == "" || job.Cron == "" || job.ExecutorHandler == "" {
-		api.respondJSON(w, 400, "缺少必填参数 (ID/Cron/Handler)", nil)
+	// 【生产级改造】：后端自动通过雪花算法生成全局唯一的纯数字 ID
+	// 这样不仅解决了前端乱填字符串导致 XXL-Job 派发失败的问题，而且生成的 ID 是按时间趋势递增的
+	job.ID = sfNode.Generate().String()
+
+	// 基础参数防呆校验 (不再需要前端传 ID)
+	if job.Cron == "" || job.ExecutorHandler == "" {
+		api.respondJSON(w, 400, "缺少必填参数 (Cron/Handler)", nil)
 		return
 	}
 

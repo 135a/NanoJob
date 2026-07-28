@@ -3,6 +3,7 @@ module nanojob
 go 1.26.4
 
 require (
+	github.com/bwmarrin/snowflake v0.3.0 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.7.0 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
