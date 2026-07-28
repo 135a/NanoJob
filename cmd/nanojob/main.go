@@ -173,12 +173,18 @@ func scheduleJob(job *store.JobInfo) {
 	now := time.Now().Unix()
 
 	// ⭐️ Misfire 漏发补偿机制 ⭐️
-	// 如果配置里存在预期的执行时间，而且当前时间已经超过了预期时间 (给 5 秒网络宽限期)
-	if job.NextTriggerTime > 0 && job.NextTriggerTime < now-5 {
-		fmt.Printf("\n[Misfire 预警] 发现任务 %s 在宕机期间漏发！立即触发 [FIRE_ONCE_NOW] 补偿机制！\n", job.ID)
-		
-		// 独立开一个协程，立刻把漏掉的任务补发出去！(纯派发，不干扰后续正常的调度循环)
-		go fireOnce(job)
+	// 如果配置里存在预期的执行时间，而且当前时间已经超过了预期时间 (给 5 秒网络宽限期),因为延迟是常见的,不应把任何延迟视为漏发,所以我们给了一个5秒的宽限期,如果超过5秒就认为是漏发了
+	if job.NextTriggerTime > 0 {
+		if job.NextTriggerTime < now-5 {
+			fmt.Printf("\n[Misfire 预警] 发现任务 %s 在宕机期间漏发！立即触发 [FIRE_ONCE_NOW] 补偿机制！\n", job.ID)
+			
+			// 独立开一个协程，立刻把漏掉的任务补发出去！(纯派发，不干扰后续正常的调度循环)
+			go fireOnce(job)
+		} else if job.NextTriggerTime <= now {
+			// TODO: 轻微迟到 (0~5秒内) 或刚好到期。目前代码会直接跳过当次执行，将其安排在下个周期。
+			// 按照大厂标准，这里应该和“没有延迟”一样，立刻触发当次执行，然后再算下一次的时间扔进时间轮。
+			// go fireOnce(job)
+		}
 	}
 
 	// A. 翻译官出马：算一下距离下一次执行还有多少秒
