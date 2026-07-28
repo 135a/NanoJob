@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -152,8 +153,15 @@ func fireOnce(job *store.JobInfo) {
 
 	for _, shard := range shardResults {
 		go func(s router.ShardResult) {
+			// 把字符串类型的 job.ID 转成 XXL-Job 客户端要求的数字类型
+			realJobID, err := strconv.Atoi(job.ID)
+			if err != nil {
+				// 兜底处理：如果解析失败默认传 0，避免程序崩溃。
+				fmt.Printf("   -> ⚠️ 警告：任务 ID [%s] 无法转换为数字类型, %v\n", job.ID, err)
+			}
+
 			req := &xxljob.RunReq{
-				JobID:           10086,
+				JobID:           realJobID,
 				ExecutorHandler: job.ExecutorHandler,
 				GlueType:        "BEAN",
 				BroadcastIndex:  s.BroadcastIndex,
