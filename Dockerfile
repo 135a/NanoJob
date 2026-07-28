@@ -1,23 +1,34 @@
-# 编译阶段：利用官方 Go 镜像进行源码编译
-FROM golang:alpine AS builder
+# 使用官方 Go 镜像作为构建环境
+FROM golang:1.20-alpine AS builder
+
+# 设置工作目录
 WORKDIR /app
+
+# 配置 Go 代理，加速国内下载
+ENV GOPROXY=https://goproxy.cn,direct
+
+# 复制 go.mod 和 go.sum (如果有的话)
+COPY go.mod go.sum* ./
+RUN go mod download
+
+# 复制所有源码
 COPY . .
-# 设置国内代理并禁用 CGO，编译为静态链接文件
-RUN go env -w GOPROXY=https://goproxy.cn,direct && \
-    CGO_ENABLED=0 GOOS=linux go build -o nanojob ./cmd/nanojob/main.go
 
-# 运行阶段：采用极简的 alpine 镜像，剥离编译环境，使得最终镜像体积通常小于 20MB
+# 编译成名为 nanojob 的可执行文件
+RUN go build -o /nanojob ./cmd/nanojob
+
+# 使用极其轻量级的 alpine 作为最终运行镜像
 FROM alpine:latest
-WORKDIR /app
 
-# 从 builder 阶段复制编译好的二进制文件
-COPY --from=builder /app/nanojob .
+WORKDIR /root/
 
-# 赋予可执行权限
-RUN chmod +x ./nanojob
+# 从 builder 阶段把编译好的执行文件拷贝过来
+COPY --from=builder /nanojob .
+# 把前端静态页面拷贝过来
+COPY --from=builder /app/ui ./ui
 
-# 声明对外暴露 8080 端口
+# 暴露 8080 端口
 EXPOSE 8080
 
-# 设置容器启动的默认指令，后续可通过 K8s args 覆盖或补充参数
-ENTRYPOINT ["./nanojob"]
+# 启动命令，默认连接名为 nanojob-etcd 的容器
+CMD ["./nanojob", "-etcd=nanojob-etcd:2379", "-port=8080"]

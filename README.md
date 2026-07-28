@@ -55,7 +55,16 @@ NanoJob 是一个使用 Go 语言重写底层核心逻辑的**高性能分布式
 - Go 1.20+
 - etcd 服务（本地单机或云端集群均可）
 
-### 1. 本地极速启动
+### 1. Docker Compose 极速体验 (强推！30秒一键启动)
+这是为了让新用户最快体验到项目魅力准备的极速启动包。你不需要安装任何 Go 环境或数据库。
+
+```bash
+# 在项目根目录，只需执行这一行命令：
+docker-compose up -d
+```
+启动成功后，直接打开浏览器访问 `http://127.0.0.1:8080`，即可沉浸式体验极具极客审美的**暗黑模式可视化大盘**！此环境包含了一个完整的 etcd 和 Go 调度引擎，完美运行所有分布式核心代码。
+
+### 2. 源码本地调试启动
 通过极简的命令行参数，你可以轻松点火启动 NanoJob，并动态挂载 etcd 节点和监听端口：
 
 ```bash
@@ -68,7 +77,7 @@ go run ./cmd/nanojob/main.go -etcd="etcd-service.local:2379" -port="9090"
 ```
 启动成功后，打开浏览器访问 `http://127.0.0.1:8080`，即可沉浸式体验极具极客审美的**暗黑模式可视化大盘**！
 
-### 2. Kubernetes 云原生部署 (推荐)
+### 3. Kubernetes 云原生部署 (大厂生产级推荐)
 本项目原生提供 `Dockerfile` 和标准的 `deployment.yaml`，享受一行命令部署大厂级云原生调度的畅快体验：
 
 ```bash
@@ -79,7 +88,7 @@ docker build -t nanojob/engine:v1.0 .
 kubectl apply -f deploy/k8s/nanojob-deployment.yaml
 ```
 
-### 3. Java 兵团接入（零侵入）
+### 4. Java 兵团接入（零侵入）
 我们做到了惊人的向后兼容！对于你下游的 Java/Spring Boot 业务应用，**不需要修改哪怕一行核心业务代码**。
 你只需要打开你的 `application.yml`，把原来老版控制台的 IP 替换成咱们 NanoJob 引擎的新 IP 即可：
 

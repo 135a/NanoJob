@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  # 1. 单节点 Etcd 服务 (用作存储和选主)
+  etcd:
+    image: bitnami/etcd:3.5
+    container_name: nanojob-etcd
+    environment:
+      - ALLOW_NONE_AUTHENTICATION=yes
+      - ETCD_ADVERTISE_CLIENT_URLS=http://nanojob-etcd:2379
+    ports:
+      - "2379:2379"
+
+  # 2. NanoJob Go 调度引擎
+  nanojob:
+    build: .
+    container_name: nanojob-engine
+    depends_on:
+      - etcd
+    ports:
+      - "8080:8080"
