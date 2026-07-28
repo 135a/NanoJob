@@ -62,6 +62,10 @@ func main() {
 		fmt.Println("\n[4/5] 🛡️ 正在进行全局 Leader 竞选，后台阻塞等待上位...")
 		
 		// 创建 5秒 租约 (TTL=5)
+		// 这里的 concurrency.WithTTL(5) 是一个“函数式选项 (Functional Option)”。
+		// 我们可以在后面继续追加其它可选配置，例如：
+		// concurrency.WithContext(ctx)      - 绑定特定的上下文，用于提前取消会话
+		// concurrency.WithSessionID(id)     - 指定一个已存在的 Lease ID 来恢复会话
 		session, err := concurrency.NewSession(etcdStore.GetClient(), concurrency.WithTTL(5))
 		if err != nil {
 			fmt.Printf("创建 etcd Session 失败: %v\n", err)
