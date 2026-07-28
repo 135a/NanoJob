@@ -11,18 +11,23 @@ import (
 
 // RunReq 完美复刻 XXL-Job 触发任务时的 JSON 请求体格式
 type RunReq struct {
-	JobID                 int    `json:"jobId"`                 // 任务 ID
-	ExecutorHandler       string `json:"executorHandler"`       // Java 端的 @XxlJob("名字")
-	ExecutorParams        string `json:"executorParams"`        // 任务参数
-	ExecutorBlockStrategy string `json:"executorBlockStrategy"` // 阻塞处理策略 (如 SERIAL_EXECUTION)
+	// --- 【核心必传参数】当前代码直接依赖的 ---
+	JobID           int    `json:"jobId"`           // 任务 ID (必须是数字，Java端依赖此记录日志)
+	ExecutorHandler string `json:"executorHandler"` // 核心暗号：Java 端的 @XxlJob("名字")
+	GlueType        string `json:"glueType"`        // 运行模式 (普通任务通常固定写死为 "BEAN")
+	BroadcastIndex  int    `json:"broadcastIndex"`  // 分片序号 (海量数据分片广播策略的核心)
+	BroadcastTotal  int    `json:"broadcastTotal"`  // 分片总数
+
+	// --- 【进阶预留参数】未来完善架构功能时会用到 ---
+	ExecutorParams        string `json:"executorParams"`        // 任务参数 (动态传参用，例如 "清理30天前的日志")
+	ExecutorBlockStrategy string `json:"executorBlockStrategy"` // 阻塞处理策略 (如 SERIAL_EXECUTION 单机串行排队)
 	ExecutorTimeout       int    `json:"executorTimeout"`       // 任务超时时间
-	LogID                 int64  `json:"logId"`                 // 调度日志 ID
+	LogID                 int64  `json:"logId"`                 // 调度日志 ID (在后台查看执行日志详情时使用)
 	LogDateTime           int64  `json:"logDateTime"`           // 调度时间
-	GlueType              string `json:"glueType"`              // 运行模式 (通常是 BEAN)
-	GlueSource            string `json:"glueSource"`            // 动态代码 (不用管)
-	GlueUpdatetime        int64  `json:"glueUpdatetime"`        // 更新时间 (不用管)
-	BroadcastIndex        int    `json:"broadcastIndex"`        // 分片序号 (重点：解决海量数据的关键)
-	BroadcastTotal        int    `json:"broadcastTotal"`        // 分片总数 (重点)
+
+	// --- 【边缘无用参数】仅为兼容 XXL-Job 底层协议凑数，基本用不到 ---
+	GlueSource     string `json:"glueSource"`     // 动态源码 (供 GLUE 模式在线动态下发代码片段使用)
+	GlueUpdatetime int64  `json:"glueUpdatetime"` // 源码更新时间
 }
 
 // RunResp XXL-Job 执行器返回的标准响应格式
