@@ -19,6 +19,7 @@ import (
 	"nanojob/core/router"
 	"nanojob/core/store"
 	"nanojob/core/timewheel"
+	"nanojob/pkg/uid"
 )
 
 var (
@@ -45,6 +46,15 @@ func main() {
 		panic(fmt.Sprintf("致命错误：无法连接 etcd 集群 [%s]！ %v", *etcdAddr, err))
 	}
 	fmt.Println("[1/5] etcd 云原生配置中心连接成功！")
+
+	// 1.5 从 etcd 动态抢占 WorkerID (大厂机房级解决方案)
+	workerID, err := store.ClaimWorkerID(etcdStore.GetClient(), "nanojob-engine")
+	if err != nil {
+		panic(fmt.Sprintf("致命错误：无法从 etcd 分配机器工号！ %v", err))
+	}
+	if err := uid.Init(workerID); err != nil {
+		panic(fmt.Sprintf("致命错误：雪花算法初始化失败！ %v", err))
+	}
 
 	// 2. 初始化 Cron 解析器
 	cronParser = parser.NewCronParser()
