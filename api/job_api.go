@@ -10,21 +10,19 @@ import (
 	"nanojob/pkg/uid"
 )
 
-// JobAPI 封装了对外暴露的管理端接口
-type JobAPI struct {
+// JobAPI 灏佽浜嗗澶栨毚闇茬殑绠＄悊绔帴鍙?type JobAPI struct {
 	Store          *store.EtcdStore
-	// 这是一个“钩子(Hook)”函数：当 API 接收到新任务时，不仅要存库，还要通过这个钩子通知 main.go 热挂载到时间轮
-	ScheduleNotify func(job *store.JobInfo) 
+	// 杩欐槸涓€涓€滈挬瀛?Hook)鈥濆嚱鏁帮細褰?API 鎺ユ敹鍒版柊浠诲姟鏃讹紝涓嶄粎瑕佸瓨搴擄紝杩樿閫氳繃杩欎釜閽╁瓙閫氱煡 main.go 鐑寕杞藉埌鏃堕棿杞?	ScheduleNotify func(job *store.JobInfo) 
 }
 
-// APIResponse 统一返回给前端 JSON 格式规范
+// APIResponse 缁熶竴杩斿洖缁欏墠绔?JSON 鏍煎紡瑙勮寖
 type APIResponse struct {
 	Code int         `json:"code"`
 	Msg  string      `json:"msg"`
 	Data interface{} `json:"data"`
 }
 
-// respondJSON 是一个辅助工具，顺便解决了前端最头疼的跨域 (CORS) 问题
+// respondJSON 鏄竴涓緟鍔╁伐鍏凤紝椤轰究瑙ｅ喅浜嗗墠绔渶澶寸柤鐨勮法鍩?(CORS) 闂
 func (api *JobAPI) respondJSON(w http.ResponseWriter, code int, msg string, data interface{}) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE")
@@ -34,12 +32,10 @@ func (api *JobAPI) respondJSON(w http.ResponseWriter, code int, msg string, data
 	json.NewEncoder(w).Encode(APIResponse{Code: code, Msg: msg, Data: data})
 }
 
-// ======== 下面是核心的 CRUD 接口 ========
+// ======== 涓嬮潰鏄牳蹇冪殑 CRUD 鎺ュ彛 ========
 
-// ListJobs 接口：获取所有任务
-func (api *JobAPI) ListJobs(w http.ResponseWriter, r *http.Request) {
-	// 遇到前端发起的 OPTIONS 跨域预检请求，直接放行
-	if r.Method == http.MethodOptions {
+// ListJobs 鎺ュ彛锛氳幏鍙栨墍鏈変换鍔?func (api *JobAPI) ListJobs(w http.ResponseWriter, r *http.Request) {
+	// 閬囧埌鍓嶇鍙戣捣鐨?OPTIONS 璺ㄥ煙棰勬璇锋眰锛岀洿鎺ユ斁琛?	if r.Method == http.MethodOptions {
 		api.respondJSON(w, 200, "ok", nil)
 		return
 	}
@@ -49,14 +45,13 @@ func (api *JobAPI) ListJobs(w http.ResponseWriter, r *http.Request) {
 
 	jobs, err := api.Store.ListJobs(ctx)
 	if err != nil {
-		api.respondJSON(w, 500, "从 etcd 获取任务失败: "+err.Error(), nil)
+		api.respondJSON(w, 500, "浠?etcd 鑾峰彇浠诲姟澶辫触: "+err.Error(), nil)
 		return
 	}
 	api.respondJSON(w, 200, "success", jobs)
 }
 
-// AddJob 接口：新建任务并热加载
-func (api *JobAPI) AddJob(w http.ResponseWriter, r *http.Request) {
+// AddJob 鎺ュ彛锛氭柊寤轰换鍔″苟鐑姞杞?func (api *JobAPI) AddJob(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodOptions {
 		api.respondJSON(w, 200, "ok", nil)
 		return
@@ -64,38 +59,37 @@ func (api *JobAPI) AddJob(w http.ResponseWriter, r *http.Request) {
 
 	var job store.JobInfo
 	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
-		api.respondJSON(w, 400, "JSON 格式解析失败", nil)
+		api.respondJSON(w, 400, "JSON 鏍煎紡瑙ｆ瀽澶辫触", nil)
 		return
 	}
 
-	// 【生产级改造】：后端通过全新大厂级动态配置好的 UID 生成器，生成全局唯一 ID
+	// 銆愮敓浜х骇鏀归€犮€戯細鍚庣閫氳繃鍏ㄦ柊澶у巶绾у姩鎬侀厤缃ソ鐨?UID 鐢熸垚鍣紝鐢熸垚鍏ㄥ眬鍞竴 ID
 	job.ID = uid.Generate()
 
-	// 基础参数防呆校验 (不再需要前端传 ID)
+	// 鍩虹鍙傛暟闃插憜鏍￠獙 (涓嶅啀闇€瑕佸墠绔紶 ID)
 	if job.Cron == "" || job.ExecutorHandler == "" {
-		api.respondJSON(w, 400, "缺少必填参数 (Cron/Handler)", nil)
+		api.respondJSON(w, 400, "缂哄皯蹇呭～鍙傛暟 (Cron/Handler)", nil)
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// 1. 物理落地：写入真实 etcd
+	// 1. 鐗╃悊钀藉湴锛氬啓鍏ョ湡瀹?etcd
 	if err := api.Store.SaveJob(ctx, &job); err != nil {
-		api.respondJSON(w, 500, "写入 etcd 失败: "+err.Error(), nil)
+		api.respondJSON(w, 500, "鍐欏叆 etcd 澶辫触: "+err.Error(), nil)
 		return
 	}
 
-	// 2. 内存热加载：通知主引擎立刻计算 Cron 倒计时，丢进时间轮！
+	// 2. 鍐呭瓨鐑姞杞斤細閫氱煡涓诲紩鎿庣珛鍒昏绠?Cron 鍊掕鏃讹紝涓㈣繘鏃堕棿杞紒
 	if api.ScheduleNotify != nil {
 		api.ScheduleNotify(&job)
 	}
 
-	api.respondJSON(w, 200, "任务创建并启动成功！", nil)
+	api.respondJSON(w, 200, "浠诲姟鍒涘缓骞跺惎鍔ㄦ垚鍔燂紒", nil)
 }
 
-// RegisterRoutes 注册全部路由
-func (api *JobAPI) RegisterRoutes() {
-	http.HandleFunc("/api/job/list", api.ListJobs)
-	http.HandleFunc("/api/job/add", api.AddJob)
+// RegisterRoutes 娉ㄥ唽鍏ㄩ儴璺敱锛堝叏閮ㄦ帴鍙ｇ粡杩?AuthMiddleware 閴存潈鎷︽埅锛?func (api *JobAPI) RegisterRoutes() {
+	http.HandleFunc("/api/job/list", AuthMiddleware(api.ListJobs))
+	http.HandleFunc("/api/job/add", AuthMiddleware(api.AddJob))
 }

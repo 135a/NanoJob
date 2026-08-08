@@ -29,133 +29,122 @@ var (
 )
 
 func main() {
-	// 解析命令行启动参数
-	etcdAddr := flag.String("etcd", "127.0.0.1:2379", "etcd 节点地址，多个用逗号分隔 (例: 10.0.0.1:2379,10.0.0.2:2379)")
-	port := flag.String("port", "8080", "控制台及心跳接口的 HTTP 监听端口")
+	// 瑙ｆ瀽鍛戒护琛屽惎鍔ㄥ弬鏁?	etcdAddr := flag.String("etcd", "127.0.0.1:2379", "etcd 鑺傜偣鍦板潃锛屽涓敤閫楀彿鍒嗛殧 (渚? 10.0.0.1:2379,10.0.0.2:2379)")
+	port := flag.String("port", "8080", "鎺у埗鍙板強蹇冭烦鎺ュ彛鐨?HTTP 鐩戝惉绔彛")
 	flag.Parse()
 
 	fmt.Println("========================================")
-	fmt.Println("🚀 NanoJob 企业级分布式调度引擎启动中...")
+	fmt.Println("馃殌 NanoJob 浼佷笟绾у垎甯冨紡璋冨害寮曟搸鍚姩涓?..")
 	fmt.Println("========================================")
 
-	// 1. 初始化持久层 (连接 etcd 集群)
+	// 1. 鍒濆鍖栨寔涔呭眰 (杩炴帴 etcd 闆嗙兢)
 	var err error
 	endpoints := strings.Split(*etcdAddr, ",")
 	etcdStore, err = store.NewEtcdStore(endpoints)
 	if err != nil {
-		panic(fmt.Sprintf("致命错误：无法连接 etcd 集群 [%s]！ %v", *etcdAddr, err))
+		panic(fmt.Sprintf("鑷村懡閿欒锛氭棤娉曡繛鎺?etcd 闆嗙兢 [%s]锛?%v", *etcdAddr, err))
 	}
-	fmt.Println("[1/5] etcd 云原生配置中心连接成功！")
+	fmt.Println("[1/5] etcd 浜戝師鐢熼厤缃腑蹇冭繛鎺ユ垚鍔燂紒")
 
-	// 1.5 从 etcd 动态抢占 WorkerID (大厂机房级解决方案)
+	// 1.5 浠?etcd 鍔ㄦ€佹姠鍗?WorkerID (澶у巶鏈烘埧绾цВ鍐虫柟妗?
 	workerID, err := store.ClaimWorkerID(etcdStore.GetClient(), "nanojob-engine")
 	if err != nil {
-		panic(fmt.Sprintf("致命错误：无法从 etcd 分配机器工号！ %v", err))
+		panic(fmt.Sprintf("鑷村懡閿欒锛氭棤娉曚粠 etcd 鍒嗛厤鏈哄櫒宸ュ彿锛?%v", err))
 	}
 	if err := uid.Init(workerID); err != nil {
-		panic(fmt.Sprintf("致命错误：雪花算法初始化失败！ %v", err))
+		panic(fmt.Sprintf("鑷村懡閿欒锛氶洩鑺辩畻娉曞垵濮嬪寲澶辫触锛?%v", err))
 	}
 
-	// 2. 初始化 Cron 解析器
-	cronParser = parser.NewCronParser()
-	fmt.Println("[2/5] Cron 翻译官已就位，支持 Spring 6位秒级语法！")
+	// 2. 鍒濆鍖?Cron 瑙ｆ瀽鍣?	cronParser = parser.NewCronParser()
+	fmt.Println("[2/5] Cron 缈昏瘧瀹樺凡灏变綅锛屾敮鎸?Spring 6浣嶇绾ц娉曪紒")
 
-	// 3. 初始化无状态注册表 (注入 etcd 客户端)
+	// 3. 鍒濆鍖栨棤鐘舵€佹敞鍐岃〃 (娉ㄥ叆 etcd 瀹㈡埛绔?
 	registry.Init(etcdStore.GetClient())
-	fmt.Println("[3/5] 基于 etcd Lease 的无状态 Registry 启动成功！")
+	fmt.Println("[3/5] 鍩轰簬 etcd Lease 鐨勬棤鐘舵€?Registry 鍚姩鎴愬姛锛?)
 
-	// 4. 初始化内存时间轮 (先初始化防止 API 调用报空指针)
+	// 4. 鍒濆鍖栧唴瀛樻椂闂磋疆 (鍏堝垵濮嬪寲闃叉 API 璋冪敤鎶ョ┖鎸囬拡)
 	tw = timewheel.New(1*time.Second, 60)
 
-	// 5. [架构重构] 控制面脑裂与分布式选主 (Control Plane Split-Brain & Leader Election)
-	// ⚠️ 必须把竞选逻辑放入后台协程，绝对不能阻塞主线程启动 HTTP Server，否则 Standby 节点将无法接收心跳！
+	// 5. [鏋舵瀯閲嶆瀯] 鎺у埗闈㈣剳瑁備笌鍒嗗竷寮忛€変富 (Control Plane Split-Brain & Leader Election)
+	// 鈿狅笍 蹇呴』鎶婄珵閫夐€昏緫鏀惧叆鍚庡彴鍗忕▼锛岀粷瀵逛笉鑳介樆濉炰富绾跨▼鍚姩 HTTP Server锛屽惁鍒?Standby 鑺傜偣灏嗘棤娉曟帴鏀跺績璺筹紒
 	go func() {
-		fmt.Println("\n[4/5] 🛡️ 正在进行全局 Leader 竞选，后台阻塞等待上位...")
+		fmt.Println("\n[4/5] 馃洝锔?姝ｅ湪杩涜鍏ㄥ眬 Leader 绔為€夛紝鍚庡彴闃诲绛夊緟涓婁綅...")
 		
-		// 创建 5秒 租约 (TTL=5)
-		// 这里的 concurrency.WithTTL(5) 是一个“函数式选项 (Functional Option)”。
-		// 我们可以在后面继续追加其它可选配置，例如：
-		// concurrency.WithContext(ctx)      - 绑定特定的上下文，用于提前取消会话
-		// concurrency.WithSessionID(id)     - 指定一个已存在的 Lease ID 来恢复会话
-		session, err := concurrency.NewSession(etcdStore.GetClient(), concurrency.WithTTL(5))
+		// 鍒涘缓 5绉?绉熺害 (TTL=5)
+		// 杩欓噷鐨?concurrency.WithTTL(5) 鏄竴涓€滃嚱鏁板紡閫夐」 (Functional Option)鈥濄€?		// 鎴戜滑鍙互鍦ㄥ悗闈㈢户缁拷鍔犲叾瀹冨彲閫夐厤缃紝渚嬪锛?		// concurrency.WithContext(ctx)      - 缁戝畾鐗瑰畾鐨勪笂涓嬫枃锛岀敤浜庢彁鍓嶅彇娑堜細璇?		// concurrency.WithSessionID(id)     - 鎸囧畾涓€涓凡瀛樺湪鐨?Lease ID 鏉ユ仮澶嶄細璇?		session, err := concurrency.NewSession(etcdStore.GetClient(), concurrency.WithTTL(5))
 		if err != nil {
-			fmt.Printf("创建 etcd Session 失败: %v\n", err)
+			fmt.Printf("鍒涘缓 etcd Session 澶辫触: %v\n", err)
 			return
 		}
 		defer session.Close()
 
-		// 创建名为 "/nanojob/election" 的竞选房间
-		election := concurrency.NewElection(session, "/nanojob/election")
+		// 鍒涘缓鍚嶄负 "/nanojob/election" 鐨勭珵閫夋埧闂?		election := concurrency.NewElection(session, "/nanojob/election")
 
-		// 获取本机Hostname作为节点标识
+		// 鑾峰彇鏈満Hostname浣滀负鑺傜偣鏍囪瘑
 		hostname, _ := os.Hostname()
 		nodeID := fmt.Sprintf("engine-%s", hostname)
 
-		// 开始抢锁！此方法会 阻塞，直到抢到锁为止。未抢到锁的机器将在此永久待命 (Standby)。
-		if err := election.Campaign(context.Background(), nodeID); err != nil {
-			fmt.Printf("竞选 Leader 失败退出: %v\n", err)
+		// 寮€濮嬫姠閿侊紒姝ゆ柟娉曚細 闃诲锛岀洿鍒版姠鍒伴攣涓烘銆傛湭鎶㈠埌閿佺殑鏈哄櫒灏嗗湪姝ゆ案涔呭緟鍛?(Standby)銆?		if err := election.Campaign(context.Background(), nodeID); err != nil {
+			fmt.Printf("绔為€?Leader 澶辫触閫€鍑? %v\n", err)
 			return
 		}
 
 		// =========================================================
-		// ⚠️ 只有成功当选为 Leader 的机器，代码才会继续往下执行！ ⚠️
+		// 鈿狅笍 鍙湁鎴愬姛褰撻€変负 Leader 鐨勬満鍣紝浠ｇ爜鎵嶄細缁х画寰€涓嬫墽琛岋紒 鈿狅笍
 		// =========================================================
-		fmt.Printf("🔥 竞选成功！当前节点 [%s] 已接管整个集群调度大权！\n\n", nodeID)
+		fmt.Printf("馃敟 绔為€夋垚鍔燂紒褰撳墠鑺傜偣 [%s] 宸叉帴绠℃暣涓泦缇よ皟搴﹀ぇ鏉冿紒\n\n", nodeID)
 
-		// 启动内存时间轮 (仅 Leader 运行)
+		// 鍚姩鍐呭瓨鏃堕棿杞?(浠?Leader 杩愯)
 		tw.Start()
-		fmt.Println("[5/5] TimeWheel 核心引擎点火成功，开始静默跳动...")
+		fmt.Println("[5/5] TimeWheel 鏍稿績寮曟搸鐐圭伀鎴愬姛锛屽紑濮嬮潤榛樿烦鍔?..")
 
-		// 引擎重启恢复！从 etcd 捞出所有存量任务 (仅 Leader 运行)
+		// 寮曟搸閲嶅惎鎭㈠锛佷粠 etcd 鎹炲嚭鎵€鏈夊瓨閲忎换鍔?(浠?Leader 杩愯)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		jobs, err := etcdStore.ListJobs(ctx)
 		if err != nil {
-			fmt.Printf("警告：从 etcd 拉取任务失败: %v\n", err)
+			fmt.Printf("璀﹀憡锛氫粠 etcd 鎷夊彇浠诲姟澶辫触: %v\n", err)
 		} else {
-			fmt.Printf("      -> 从 etcd 成功恢复了 %d 个历史任务，开始挂载...\n", len(jobs))
+			fmt.Printf("      -> 浠?etcd 鎴愬姛鎭㈠浜?%d 涓巻鍙蹭换鍔★紝寮€濮嬫寕杞?..\n", len(jobs))
 			for _, job := range jobs {
 				scheduleJob(job)
 			}
 		}
 
-		// ⚠️ 极其关键的一步：阻塞当前协程，绝不能让它退出！
-		// 如果协程退出，defer session.Close() 就会被执行，etcd 租约会被撤销。
-		// 这会导致其他替补节点立刻抢到锁，从而引发所有节点都变成 Leader 的超级脑裂灾难！
+		// 鈿狅笍 鏋佸叾鍏抽敭鐨勪竴姝ワ細闃诲褰撳墠鍗忕▼锛岀粷涓嶈兘璁╁畠閫€鍑猴紒
+		// 濡傛灉鍗忕▼閫€鍑猴紝defer session.Close() 灏变細琚墽琛岋紝etcd 绉熺害浼氳鎾ら攢銆?		// 杩欎細瀵艰嚧鍏朵粬鏇胯ˉ鑺傜偣绔嬪埢鎶㈠埌閿侊紝浠庤€屽紩鍙戞墍鏈夎妭鐐归兘鍙樻垚 Leader 鐨勮秴绾ц剳瑁傜伨闅撅紒
 		select {}
 	}()
 
-	// 6. 注册管理后台 API (提供给可视化网页调用)
+	// 6. 娉ㄥ唽绠＄悊鍚庡彴 API (鎻愪緵缁欏彲瑙嗗寲缃戦〉璋冪敤)
 	jobApi := &api.JobAPI{
 		Store:          etcdStore,
-		// 【灵魂联动】前端调接口新增任务时，触发这个钩子，直接调用下面的 scheduleJob 函数进行热启动！
+		// 銆愮伒榄傝仈鍔ㄣ€戝墠绔皟鎺ュ彛鏂板浠诲姟鏃讹紝瑙﹀彂杩欎釜閽╁瓙锛岀洿鎺ヨ皟鐢ㄤ笅闈㈢殑 scheduleJob 鍑芥暟杩涜鐑惎鍔紒
 		ScheduleNotify: scheduleJob, 
 	}
 	jobApi.RegisterRoutes()
 
-	// 7. 启动 HTTP 监听，迎接 Java 兵团的注册
-	// TODO: [架构缺陷 3] 接口缺乏安全鉴权 (API Auth)
-	// 当前所有 /api 接口均在公网/内网裸奔，极度危险。应当在此处加入 HTTP Middleware (拦截器) 校验安全 Token。
-	
-	// TODO: [架构缺陷 4] 缺乏执行结果的闭环回调与日志 (Callback & Logging)
-	// 当前引擎发包后(fire-and-forget)无法得知 Java 任务的最终成功/失败状态。
-	// 需要新增类似 /api/callback 的接口供 Java 机器打完仗后上报战况，并持久化日志至 MySQL/ES 以供前端页面展示。
-	http.HandleFunc("/api/registry", registry.ReceiveHeartbeat)
+	// 7. 娉ㄥ唽鎵ц缁撴灉鍥炶皟鎺ュ彛 (Issue #5: Callback & Logging)
+	callbackApi := &api.CallbackAPI{EtcdClient: etcdStore.GetClient()}
+	callbackApi.RegisterRoutes()
+
+	// 8. 鍚姩 HTTP 鐩戝惉锛岃繋鎺?Java 鍏靛洟鐨勬敞鍐?	// [Issue #6] 鎵€鏈夌鐞?API (/api/job/*, /api/callback*) 宸查€氳繃 AuthMiddleware 閴存潈
+	// 娉ㄥ唽蹇冭烦鎺ュ彛鍚屾牱鍔犱笂閴存潈淇濇姢
+	http.HandleFunc("/api/registry", api.AuthMiddleware(registry.ReceiveHeartbeat))
 	
 	listenUrl := ":" + *port
-	fmt.Printf("\n✅ NanoJob 启动完成！正在监听 %s 端口，等待执行器接入...\n", listenUrl)
+	fmt.Printf("\n鉁?NanoJob 鍚姩瀹屾垚锛佹鍦ㄧ洃鍚?%s 绔彛锛岀瓑寰呮墽琛屽櫒鎺ュ叆...\n", listenUrl)
 	if err := http.ListenAndServe(listenUrl, nil); err != nil {
 		panic(err)
 	}
 }
 
-// fireOnce 纯粹的派发逻辑，打完仗就撤，绝不自循环（供正常触发和 Misfire 补偿复用）
-func fireOnce(job *store.JobInfo) {
-	fmt.Printf("\n[%s] ⚡ 任务触发！开始派发 -> %s\n", time.Now().Format("15:04:05"), job.ID)
+// fireOnce 绾补鐨勬淳鍙戦€昏緫锛屾墦瀹屼粭灏辨挙锛岀粷涓嶈嚜寰幆锛堜緵姝ｅ父瑙﹀彂鍜?Misfire 琛ュ伩澶嶇敤锛?func fireOnce(job *store.JobInfo) {
+	fmt.Printf("\n[%s] 鈿?浠诲姟瑙﹀彂锛佸紑濮嬫淳鍙?-> %s\n", time.Now().Format("15:04:05"), job.ID)
 
 	aliveNodes := registry.GetAliveNodes(job.AppName)
 	if len(aliveNodes) == 0 {
-		fmt.Printf("   -> 警告：业务组 [%s] 下没有活着的 Java 机器，任务只能跳过。\n", job.AppName)
+		fmt.Printf("   -> 璀﹀憡锛氫笟鍔＄粍 [%s] 涓嬫病鏈夋椿鐫€鐨?Java 鏈哄櫒锛屼换鍔″彧鑳借烦杩囥€俓n", job.AppName)
 		return
 	}
 	
@@ -163,11 +152,10 @@ func fireOnce(job *store.JobInfo) {
 
 	for _, shard := range shardResults {
 		go func(s router.ShardResult) {
-			// 把字符串类型的 job.ID 转成 XXL-Job 客户端要求的数字类型
+			// 鎶婂瓧绗︿覆绫诲瀷鐨?job.ID 杞垚 XXL-Job 瀹㈡埛绔姹傜殑鏁板瓧绫诲瀷
 			realJobID, err := strconv.Atoi(job.ID)
 			if err != nil {
-				// 兜底处理：如果解析失败默认传 0，避免程序崩溃。
-				fmt.Printf("   -> ⚠️ 警告：任务 ID [%s] 无法转换为数字类型, %v\n", job.ID, err)
+				// 鍏滃簳澶勭悊锛氬鏋滆В鏋愬け璐ラ粯璁や紶 0锛岄伩鍏嶇▼搴忓穿婧冦€?				fmt.Printf("   -> 鈿狅笍 璀﹀憡锛氫换鍔?ID [%s] 鏃犳硶杞崲涓烘暟瀛楃被鍨? %v\n", job.ID, err)
 			}
 
 			req := &xxljob.RunReq{
@@ -178,55 +166,48 @@ func fireOnce(job *store.JobInfo) {
 				BroadcastTotal:  s.BroadcastTotal,
 			}
 			if err := xxljob.Trigger(s.TargetIP, req); err != nil {
-				fmt.Printf("   -> 派发失败 (%s): %v\n", s.TargetIP, err)
+				fmt.Printf("   -> 娲惧彂澶辫触 (%s): %v\n", s.TargetIP, err)
 			} else {
-				fmt.Printf("   -> 🚀 成功击中目标 %s (分片 %d/%d)\n", s.TargetIP, s.BroadcastIndex, s.BroadcastTotal)
+				fmt.Printf("   -> 馃殌 鎴愬姛鍑讳腑鐩爣 %s (鍒嗙墖 %d/%d)\n", s.TargetIP, s.BroadcastIndex, s.BroadcastTotal)
 			}
 		}(shard)
 	}
 }
 
-// scheduleJob 核心魔法：算时间、塞入轮子、自动循环
-func scheduleJob(job *store.JobInfo) {
+// scheduleJob 鏍稿績榄旀硶锛氱畻鏃堕棿銆佸鍏ヨ疆瀛愩€佽嚜鍔ㄥ惊鐜?func scheduleJob(job *store.JobInfo) {
 	now := time.Now().Unix()
 
-	// ⭐️ Misfire 漏发补偿机制 ⭐️
-	// 如果配置里存在预期的执行时间，而且当前时间已经超过了预期时间 (给 5 秒网络宽限期),因为延迟是常见的,不应把任何延迟视为漏发,所以我们给了一个5秒的宽限期,如果超过5秒就认为是漏发了
+	// 猸愶笍 Misfire 婕忓彂琛ュ伩鏈哄埗 猸愶笍
+	// 濡傛灉閰嶇疆閲屽瓨鍦ㄩ鏈熺殑鎵ц鏃堕棿锛岃€屼笖褰撳墠鏃堕棿宸茬粡瓒呰繃浜嗛鏈熸椂闂?(缁?5 绉掔綉缁滃闄愭湡),鍥犱负寤惰繜鏄父瑙佺殑,涓嶅簲鎶婁换浣曞欢杩熻涓烘紡鍙?鎵€浠ユ垜浠粰浜嗕竴涓?绉掔殑瀹介檺鏈?濡傛灉瓒呰繃5绉掑氨璁や负鏄紡鍙戜簡
 	if job.NextTriggerTime > 0 {
 		if job.NextTriggerTime < now-5 {
-			fmt.Printf("\n[Misfire 预警] 发现任务 %s 在宕机期间漏发！立即触发 [FIRE_ONCE_NOW] 补偿机制！\n", job.ID)
+			fmt.Printf("\n[Misfire 棰勮] 鍙戠幇浠诲姟 %s 鍦ㄥ畷鏈烘湡闂存紡鍙戯紒绔嬪嵆瑙﹀彂 [FIRE_ONCE_NOW] 琛ュ伩鏈哄埗锛乗n", job.ID)
 			
-			// 独立开一个协程，立刻把漏掉的任务补发出去！(纯派发，不干扰后续正常的调度循环)
+			// 鐙珛寮€涓€涓崗绋嬶紝绔嬪埢鎶婃紡鎺夌殑浠诲姟琛ュ彂鍑哄幓锛?绾淳鍙戯紝涓嶅共鎵板悗缁甯哥殑璋冨害寰幆)
 			go fireOnce(job)
 		} else if job.NextTriggerTime <= now {
-			// TODO: 轻微迟到 (0~5秒内) 或刚好到期。目前代码会直接跳过当次执行，将其安排在下个周期。
-			// 按照大厂标准，这里应该和“没有延迟”一样，立刻触发当次执行，然后再算下一次的时间扔进时间轮。
-			// go fireOnce(job)
+			// TODO: 杞诲井杩熷埌 (0~5绉掑唴) 鎴栧垰濂藉埌鏈熴€傜洰鍓嶄唬鐮佷細鐩存帴璺宠繃褰撴鎵ц锛屽皢鍏跺畨鎺掑湪涓嬩釜鍛ㄦ湡銆?			// 鎸夌収澶у巶鏍囧噯锛岃繖閲屽簲璇ュ拰鈥滄病鏈夊欢杩熲€濅竴鏍凤紝绔嬪埢瑙﹀彂褰撴鎵ц锛岀劧鍚庡啀绠椾笅涓€娆＄殑鏃堕棿鎵旇繘鏃堕棿杞€?			// go fireOnce(job)
 		}
 	}
 
-	// A. 翻译官出马：算一下距离下一次执行还有多少秒
+	// A. 缈昏瘧瀹樺嚭椹細绠椾竴涓嬭窛绂讳笅涓€娆℃墽琛岃繕鏈夊灏戠
 	delay, err := cronParser.NextDelay(job.Cron)
 	if err != nil {
-		fmt.Printf("[调度异常] 任务 %s 的 Cron 解析失败: %v\n", job.ID, err)
+		fmt.Printf("[璋冨害寮傚父] 浠诲姟 %s 鐨?Cron 瑙ｆ瀽澶辫触: %v\n", job.ID, err)
 		return
 	}
 
-	// ⭐️ 持久化记忆 ⭐️
-	// 算出下一次真实的绝对时间戳，并异步写回 etcd！这样哪怕下一秒断电，系统也有记忆！
-	job.NextTriggerTime = time.Now().Add(delay).Unix()
+	// 猸愶笍 鎸佷箙鍖栬蹇?猸愶笍
+	// 绠楀嚭涓嬩竴娆＄湡瀹炵殑缁濆鏃堕棿鎴筹紝骞跺紓姝ュ啓鍥?etcd锛佽繖鏍峰摢鎬曚笅涓€绉掓柇鐢碉紝绯荤粺涔熸湁璁板繂锛?	job.NextTriggerTime = time.Now().Add(delay).Unix()
 	go etcdStore.SaveJob(context.Background(), job)
 
-	// B. 定义这个任务“到点后真正要干的活”
-	var triggerFunc func()
+	// B. 瀹氫箟杩欎釜浠诲姟鈥滃埌鐐瑰悗鐪熸瑕佸共鐨勬椿鈥?	var triggerFunc func()
 	triggerFunc = func() {
-		// 1. 打仗
+		// 1. 鎵撲粭
 		fireOnce(job)
-		// 2. 灵魂自循环：重新排队！
-		scheduleJob(job)
+		// 2. 鐏甸瓊鑷惊鐜細閲嶆柊鎺掗槦锛?		scheduleJob(job)
 	}
 
-	// C. 正式把这个闭包函数，扔进时间轮排队
-	tw.AddTask(delay, job.ID, triggerFunc)
-	fmt.Printf(" -> 任务装填完毕: %s, 预计 %d 秒后引爆\n", job.ID, int(delay.Seconds()))
+	// C. 姝ｅ紡鎶婅繖涓棴鍖呭嚱鏁帮紝鎵旇繘鏃堕棿杞帓闃?	tw.AddTask(delay, job.ID, triggerFunc)
+	fmt.Printf(" -> 浠诲姟瑁呭～瀹屾瘯: %s, 棰勮 %d 绉掑悗寮曠垎\n", job.ID, int(delay.Seconds()))
 }
