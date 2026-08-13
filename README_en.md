@@ -1,104 +1,155 @@
-# NanoJob: Cloud-Native Distributed Scheduling Engine
+# NanoJob
+
+A distributed job scheduling engine written in **Go**, coordinated by **etcd**, with core protocol compatibility with **XXL-Job** executors.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Language-Go-00ADD8.svg" alt="Language">
-  <img src="https://img.shields.io/badge/Architecture-Cloud%20Native-blueviolet.svg" alt="Architecture">
-  <img src="https://img.shields.io/badge/Store-etcd-red.svg" alt="Store">
-  <img src="https://img.shields.io/badge/Ecosystem-Kubernetes-326ce5.svg" alt="Kubernetes">
+  <img src="https://img.shields.io/badge/Coordination-etcd-blue.svg" alt="etcd">
+  <img src="https://img.shields.io/badge/Compatibility-XXL--Job-important.svg" alt="XXL-Job">
 </p>
 
-## 📖 Introduction
+> **Status: learning project.** Built to study distributed scheduling, etcd coordination, and fault-tolerance design. Not production-grade; several limitations are listed below.
 
-**NanoJob** is a high-performance, distributed job scheduling control plane rewritten from the ground up in Go. 
-It maintains **100% backward compatibility** with the underlying RPC protocol of traditional enterprise schedulers (such as XXL-Job), but completely redesigns the core architecture to solve historical pain points like heavy database polling, high latency, and deployment bloat.
+## Overview
 
-NanoJob is built for the Cloud-Native era, serving as the sharpest, most lightweight scheduling solution for massive microservice architectures.
-
----
-
-## 🎯 Why NanoJob? (Solving Industry Pain Points)
-
-In massive data processing scenarios (e.g., millions of overnight interest calculations, timeout scanning for e-commerce orders), traditional Java-based scheduling frameworks face fatal bottlenecks. NanoJob crushes them one by one:
-
-1. **Eradicate Database Polling Avalanches**
-   Traditional frameworks rely on infinite loop polling against MySQL to find triggered jobs, easily causing table locks and database crashes under heavy loads. NanoJob completely abandons DB polling, utilizing a **Hierarchical TimeWheel** algorithm for lock-free, O(1) complexity, millisecond-precision triggering.
-2. **Eliminate Deployment Bloat**
-   Traditional schedulers are heavy Spring Boot processes, slow to start and consuming hundreds of megabytes of RAM per node. NanoJob compiles into a minimalist Linux static binary (< 20MB) with an extremely low memory footprint. Its millisecond-level startup speed makes it a perfect fit for Kubernetes (K8s) instantaneous scaling.
-3. **Prevent Split-Brain with Strong Consistency**
-   Traditional schedulers use relational databases for registration and distributed locks, which are prone to "split-brain" under severe network jitter, leading to disastrous duplicate executions. NanoJob embraces **etcd**—the de facto Cloud-Native standard—leveraging its Raft algorithm to guarantee absolute strong consistency.
-
----
-
-## ⚔️ Architecture Comparison
-
-| Feature | Traditional Java Scheduler (e.g., XXL-Job) | NanoJob Engine |
+| Layer | Implementation | Notes |
 | :--- | :--- | :--- |
-| **Core Engine** | Java ThreadPool + Relational DB infinite polling | Golang Goroutines + Hierarchical TimeWheel |
-| **Storage Medium** | MySQL (Write-heavy, concurrent bottlenecks) | etcd (Strong consistency KV, supports Watch) |
-| **Heartbeat Registry** | Heavy `UPDATE` queries on DB | In-memory routines with 90s TTL auto-eviction |
-| **Cloud-Native Fit**| Poor (Stateful, heavy JVM/Tomcat dependencies) | Excellent (Stateless, 12-Factor app, K8s friendly) |
-| **High Availability** | Pessimistic DB locks | Distributed Lease & Mutex via etcd |
-| **Compatibility** | - | **100% Zero-Code Migration** (Drop-in replacement for Java clients) |
+| Storage & coordination | etcd | Job persistence, leader election, executor heartbeat registry (Lease, 90s TTL auto-eviction) |
+| Scheduling core | Single-level in-memory time wheel + circle counting | O(1) insertion (mutex-protected); engine runs at **1s tick × 60 slots** |
+| Trigger protocol | XXL-Job HTTP subset | Executor `/run` trigger + `/registry` heartbeat registration |
+| Job ID | Snowflake | Worker ID atomically claimed via etcd Txn (1–1023) |
 
----
+## Core mechanisms (three distributed-systems bugs fixed)
 
-## 🚀 Core Architectural Highlights
+### 1. Unified Watch consumption — fixes "orphan jobs"
 
-1. **Dynamic Sharding (MapReduce-like)**
-   When a job is triggered, the engine does not blindly dump millions of records onto a single machine. It dynamically senses the total number of alive Java nodes in the cluster. Using a **Broadcast + Modulo algorithm**, it dispatches unique `Index` parameters to each node. Compute power scales infinitely as you add more machines!
-2. **K8s Decoupling & Injection**
-   Fully embraces Infrastructure as Code (IaC). NanoJob avoids hardcoded configs, exposing parameters via CLI flags. In K8s, CoreDNS domains are injected via YAML args, allowing operators to hot-switch etcd IPs or listening ports without rebuilding code.
-3. **High Availability & Split-Brain Defense**
-   Powered by etcd's `concurrency.NewElection`, NanoJob guarantees strict Leader-Follower consistency. Even if deployed with 10 K8s replicas, only 1 Leader commands the TimeWheel. Severe network partitions will automatically trigger safe failovers, strictly preventing duplicate job execution (Split-Brain).
-4. **Stateless Dynamic Registry**
-   Completely eliminated legacy in-memory `sync.Map` islands. Executor heartbeats are directly bound to etcd **Leases**. If a node dies, etcd auto-expires its lease globally. The Leader accesses a real-time, globally consistent view before every dispatch, guaranteeing 100% accurate sharding routing.
-5. **Misfire Compensation Strategy**
-   Zero tolerance for business data loss during power outages. When the NanoJob cluster recovers from total downtime, the newly elected Leader automatically audits the database. Any severely delayed critical tasks are instantly salvaged via a forced `FIRE_ONCE_NOW` compensation before resuming normal TimeWheel cadence.
+**Problem**: previously a job was hot-loaded for scheduling on whichever engine received the write. A request that hit a Standby node (never elected, time wheel never started) left the job persisted but never scheduled — an orphan.
 
----
+**Fix**: scheduling is centralized on the Leader. Any engine (including Standby) only writes the job to etcd; the Leader consumes all incremental writes through etcd Watch. To close the race window between `ListJobs` and `Watch`, it uses **read-then-watch**:
 
-## 🛠️ Quick Start
+1. `ListJobs(ctx)` returns existing jobs **and** the etcd global `revision`;
+2. `WatchJobs(rev+1)` starts watching from the next revision;
+3. each Watch event is mounted via `scheduleJob`, deduplicated by `(jobID, trigger point)` to avoid re-mounting the Leader's own `NextTriggerTime` write-back (spin loop).
+
+### 2. Fail-fast leadership loss — fixes "split-brain"
+
+**Problem**: the old code spun on `select {}` after winning the election and never checked the lease. A disconnected old Leader kept dispatching like a zombie alongside the new Leader = split-brain (duplicate triggers).
+
+**Fix**: watch two complementary signals and stop scheduling the moment leadership is confirmed lost:
+
+- `session.Done()` — local signal (etcd connection lost / lease revoked), still fires when etcd is unreachable;
+- `election.Observe()` — remote signal (leader key deleted / replaced by a new Leader).
+
+On either signal: `tw.Stop()` (stop the wheel) + `watcherCancel()` (stop the watcher) + return; `defer session.Close()` revokes the lease so a Standby can take over cleanly.
+
+⚠️ Implementation detail: `Observe` may first push "I'm still the leader" — exiting on that would create a "win-then-immediately-yield" live-lock, so a loop exits only when the key is gone or holds a different node ID. On disconnect the library closes the channel internally and a closed-channel receive yields `nil` — guard against nil before touching `resp.Kvs` to avoid a panic.
+
+### 3. Deterministic execution ID + executor idempotency — fixes "handover duplicate"
+
+**Problem**: the delivery contract is at-least-once. The old leader legitimately dispatched slot N, then lost connectivity; the new leader can't know whether it was dispatched, so it compensates as a missed fire → slot N dispatched twice. This is structural in distributed systems and cannot be fully removed at the scheduler layer.
+
+**Fix**: the engine generates a **deterministic execution ID** = `jobID:triggerTimestamp` (e.g. `1834567890123456789:1723456789`), passed via `executorParams`; the Java executor atomically claims it before running:
+
+- Go `fireOnce`: `execID = jobID + ":" + slot`, marshaled as `{"executionId": execID}` into `RunReq.ExecutorParams`;
+- Java `ExecutionDedup.tryClaim()`: parses the ID from `XxlJobHelper.getJobParam()` and claims it with `ConcurrentHashMap.putIfAbsent`; a failed claim means a duplicate dispatch → skip.
+
+Key points:
+
+- the exec ID must be **deterministically derived** (never a random UUID), otherwise two dispatches yield different IDs and the executor can't recognize the duplicate;
+- the `slot` must be **snapshotted synchronously** before async dispatch (especially in misfire compensation), otherwise the async goroutine reads `job.NextTriggerTime` after it has been advanced to the next period;
+- the demo dedup table is in-process only (single JVM); multi-instance deployments need shared storage (MySQL unique index / Redis SETNX).
+
+## Benchmarks (measured on this machine)
+
+Numbers below come from `core/timewheel` microbenchmarks (**1ms tick**):
+
+| Metric | Measured | Scenario |
+| :--- | :--- | :--- |
+| Concurrent insert | 113 ns/op (~9.6M ops/s, 2 allocs/op) | 1ms tick × 3600 slots |
+| Scheduling precision | avg 4.1ms / p95 7.4ms / max 7.8ms deviation | 2000 tasks, uniform 2–4s delays |
+| Memory footprint | 1,000,000 tasks +53.5MB (56B/task) | 1ms tick × 3600 slots |
+| Trigger throughput | 50,000 tasks all fired in 3.5s, zero loss | uniform 0.5–3.5s delays |
+| Statement coverage | 100% | full Go test suite green |
+
+⚠️ **Important**: the millisecond precision and sub-microsecond inserts come from a **1ms-tick microbenchmark**. The engine runs at a **1s tick × 60 slots**, so real trigger granularity is ~1 second. Don't present the microbenchmark numbers as production accuracy.
+
+Reproduce:
+
+```bash
+go test ./core/timewheel/ -run 'TestSchedulingPrecision|TestTriggerThroughput|TestMemoryFootprint' -v
+go test ./core/timewheel/ -bench BenchmarkTimeWheelAdd -benchtime=1s -run '^$'
+```
+
+## Quick start
 
 ### Prerequisites
+
 - Go 1.20+
-- etcd server (Local single-node or Cloud cluster)
+- etcd (a single node is enough)
 
-### 1. Minimal Local Startup
-Fire up NanoJob easily via CLI flags, dynamically binding your etcd node and port:
+### 1. Docker Compose (etcd + engine)
 
 ```bash
-# Default (Connects to 127.0.0.1:2379, listens on 8080)
-go run ./cmd/nanojob/main.go
-
-# Production-grade startup with custom DNS and port
-go run ./cmd/nanojob/main.go -etcd="etcd-service.local:2379" -port="9090"
+docker-compose up -d
 ```
-Once started, visit `http://127.0.0.1:8080` in your browser to experience the sleek, dark-mode visual dashboard!
 
-### 2. Kubernetes Deployment (Recommended)
-NanoJob provides a native `Dockerfile` and standard `deployment.yaml` for a seamless Cloud-Native deployment:
+etcd on `2379`, engine on `8080`. **Note**: the compose file only includes etcd and the engine, not a Java executor — bring up the sample executor to run an end-to-end job.
+
+### 2. Run from source
 
 ```bash
-# 1. Build the lightweight Alpine image
+go run ./cmd/nanojob/main.go                          # etcd 127.0.0.1:2379, listen :8080
+go run ./cmd/nanojob/main.go -etcd="host:2379" -port="9090"
+```
+
+### 3. Web dashboard
+
+The engine does **not** serve static files. Open `ui/index.html` directly in a browser (it talks to `http://localhost:8080/api` over CORS), or serve the `ui/` directory with any static server.
+
+### 4. Kubernetes (sample manifests)
+
+```bash
 docker build -t nanojob/engine:v1.0 .
-
-# 2. Deploy to K8s cluster
 kubectl apply -f deploy/k8s/nanojob-deployment.yaml
+# the same directory also has etcd-deployment.yaml / java-executor-deployment.yaml
 ```
 
-### 3. Java Client Integration (Zero Intrusion)
-We achieved stunning backward compatibility! For your downstream Java/Spring Boot applications, **you do not need to modify a single line of core business code.**
-Simply update your `application.yml` to replace the old admin IP with the new NanoJob engine IP:
+### 5. Java executor integration
+
+The engine implements the core subset of the XXL-Job executor protocol, so xxl-job-core clients can plug in:
 
 ```yaml
 xxl:
   job:
     admin:
-      # Old Address: addresses: http://192.168.1.1:8080/xxl-job-admin
-      # New NanoJob Address:
-      addresses: http://nanojob-engine-ip:8080
+      addresses: http://<nanojob-engine-ip>:8080   # replace the old xxl-job-admin address
 ```
-Restart your Java app, and your Java legion will obediently report to NanoJob, ready to receive TimeWheel dispatches!
 
----
-*Built with ❤️ for the Cloud-Native Community.*
+See `examples/java-executor` (Spring Boot + xxl-job-core, includes the idempotency demo). The executor must report heartbeats to the engine's `/registry`.
+
+## Directory layout
+
+```
+cmd/nanojob/             engine entrypoint (election, Watch, fail-fast, wheel mounting)
+core/timewheel/          single-level time wheel (tick + circle counting)
+core/store/              etcd persistence (ListJobs returns global revision)
+core/registry/           executor heartbeat registry (etcd Lease, 90s TTL)
+core/router/             sharding broadcast / single-node routing
+core/parser/             Spring 6-field cron parsing (robfig/cron)
+adapter/xxljob/          XXL-Job trigger protocol (/run)
+pkg/uid/                 Snowflake ID generator
+examples/java-executor/  sample Java executor (with ExecutionDedup demo)
+ui/                      web dashboard (open index.html directly)
+```
+
+## Known limitations
+
+- **No execution callback**: fire-and-forget dispatch; no result/status feedback, no scheduling logs (`/api/callback` not implemented).
+- **No auth** on `/api/*` or `/api/registry`.
+- **Slightly late fires are skipped**: a trigger within 0–5s late is skipped for that cycle and rescheduled; misfire compensation only covers >5s and fires once.
+- **~1s trigger granularity**: engine wheel ticks at 1s.
+- **ROUND_ROBIN is a misnomer**: it currently always picks the first alive node.
+- **Worker ID lease loss only logs a warning** (does not exit the process); ID collision is possible under extreme disconnects.
+- **Java dedup is in-process only**: multi-instance needs MySQL unique index / Redis SETNX.
+- **No job-delete API**: `DeleteJob` exists in the store layer but has no HTTP route.
+- **No cluster stress-testing**: assumes a single etcd; etcd cluster / multi-engine scaling unverified.
