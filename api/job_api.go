@@ -11,10 +11,12 @@ import (
 )
 
 // JobAPI 封装了对外暴露的管理端接口
+// [架构修复 1] 原来的 ScheduleNotify 本机热加载钩子已被彻底删除：
+//   它导致"任务写入 Standby → Standby 的轮子从未 Start() → 任务变孤儿"。
+//   现在任意引擎（无论 Leader/Standby）都只负责把任务写进 etcd，
+//   由持有租约的 Leader 通过 etcd Watch 统一消费增量去调度 —— 调度权与"谁收到请求"彻底解耦。
 type JobAPI struct {
-	Store          *store.EtcdStore
-	// 这是一个“钩子(Hook)”函数：当 API 接收到新任务时，不仅要存库，还要通过这个钩子通知 main.go 热挂载到时间轮
-	ScheduleNotify func(job *store.JobInfo) 
+	Store *store.EtcdStore
 }
 
 // APIResponse 统一返回给前端 JSON 格式规范
@@ -47,7 +49,8 @@ func (api *JobAPI) ListJobs(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	jobs, err := api.Store.ListJobs(ctx)
+	// ListJobs 现在返回 (jobs, rev, err)，查询接口用不到 rev，用 _ 忽略
+	jobs, _, err := api.Store.ListJobs(ctx)
 	if err != nil {
 		api.respondJSON(w, 500, "从 etcd 获取任务失败: "+err.Error(), nil)
 		return
@@ -86,12 +89,10 @@ func (api *JobAPI) AddJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. 内存热加载：通知主引擎立刻计算 Cron 倒计时，丢进时间轮！
-	if api.ScheduleNotify != nil {
-		api.ScheduleNotify(&job)
-	}
-
-	api.respondJSON(w, 200, "任务创建并启动成功！", nil)
+	// 2. [架构修复 1] 写入即返回，调度交给 Leader 的 WatchJobs 统一消费。
+	//    ❌ 旧实现：api.ScheduleNotify(&job) 本机热加载 —— 请求打到 Standby 时任务变孤儿。
+	//    ✅ 新实现：Leader 通过 Watch 收到这次 Put 后，自动 scheduleJob 挂载进时间轮。
+	api.respondJSON(w, 200, "任务创建成功！已写入 etcd，Leader 将自动接管调度。", nil)
 }
 
 // RegisterRoutes 注册全部路由

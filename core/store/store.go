@@ -31,7 +31,11 @@ type Store interface {
 
 	// ListJobs 获取当前系统的所有任务！
 	// (核心：Go 引擎每次重启、或者发生故障转移时，都要调这个方法把数据库里的任务全捞出来，塞进时间轮)
-	ListJobs(ctx context.Context) ([]*JobInfo, error)
+	// [架构修复 1] 返回值多带一个 int64 = etcd 全局 Revision，
+	//   供 Leader 做 read-then-watch (ListJobs(rev) + WatchJobs(rev+1)) 统一消费增量。
+	//   ⚠️ WatchJobs 故意不进 Store 接口：它返回 clientv3.WatchChan，会把这个接口
+	//   强耦合到 etcd 的具体实现，破坏"底层可替换"的抽象。
+	ListJobs(ctx context.Context) ([]*JobInfo, int64, error)
 
 	// DeleteJob 删除任务
 	DeleteJob(ctx context.Context, id string) error

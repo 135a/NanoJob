@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/concurrency"
 
 	"nanojob/adapter/xxljob"
@@ -106,30 +109,84 @@ func main() {
 		tw.Start()
 		fmt.Println("[5/5] TimeWheel 核心引擎点火成功，开始静默跳动...")
 
-		// 引擎重启恢复！从 etcd 捞出所有存量任务 (仅 Leader 运行)
+		// 引擎重启恢复！从 etcd 捞出所有存量任务 + 记录全局 Revision (仅 Leader 运行)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		jobs, err := etcdStore.ListJobs(ctx)
+		jobs, rev, err := etcdStore.ListJobs(ctx)
 		if err != nil {
 			fmt.Printf("警告：从 etcd 拉取任务失败: %v\n", err)
 		} else {
 			fmt.Printf("      -> 从 etcd 成功恢复了 %d 个历史任务，开始挂载...\n", len(jobs))
 			for _, job := range jobs {
-				scheduleJob(job)
+				scheduleJob(job, false)
 			}
 		}
 
-		// ⚠️ 极其关键的一步：阻塞当前协程，绝不能让它退出！
-		// 如果协程退出，defer session.Close() 就会被执行，etcd 租约会被撤销。
-		// 这会导致其他替补节点立刻抢到锁，从而引发所有节点都变成 Leader 的超级脑裂灾难！
-		select {}
+		// =========================================================
+		// ⭐️ [架构修复 1] Watch 统一消费：任意引擎写入 etcd，Leader 通过 Watch 感知增量
+		//    彻底解决"任务打到 Standby 变孤儿"：调度权收拢到 Leader，Standby 只写不调度。
+		//    read-then-watch：从 rev+1 开始监听，封死"List 与 Watch 之间新增任务被漏掉"的竞态窗口。
+		//    收到事件就 scheduleJob；scheduleJob 内部按 (jobID, 触发点) 去重，
+		//    防住"Leader 自己写回 NextTriggerTime 的 Put 被自己 Watch 到 → 自旋重复挂载"。
+		// =========================================================
+		watcherCtx, watcherCancel := context.WithCancel(context.Background())
+		defer watcherCancel()
+		go func() {
+			for wresp := range etcdStore.WatchJobs(watcherCtx, rev+1) {
+				for _, ev := range wresp.Events {
+					// 跳过删除事件：已删除的任务不该被重新挂载
+					// (防止 ListJobs 失败、rev=0 兜底全量回放时，把历史删除的任务"复活")
+					if ev.Type == clientv3.EventTypeDelete {
+						continue
+					}
+					var job store.JobInfo
+					if err := json.Unmarshal(ev.Kv.Value, &job); err == nil {
+						scheduleJob(&job, false)
+					}
+				}
+			}
+		}()
+
+		// =========================================================
+		// ⭐️ [架构修复 2] fail-fast 夺权监控：租约一丢，立即停轮子、停 Watch、退出
+		//    替换原来的 select{}。select{} 永不检查租约，旧 Leader 失联后仍僵尸化派发 = 脑裂。
+		//    这里监听两个互补信号：
+		//      - session.Done()    = 本地信号（etcd 连接断开 / 租约被撤销），etcd 不可达时依然有效
+		//      - election.Observe() = 远端信号（leader key 被删 / 被替换，可能本机租约还活着）
+		//    一旦触发：tw.Stop() 停时间轮 + watcherCancel() 停 Watch + return。
+		//    return 退出后，defer session.Close() 撤销租约 → Standby 干净接管，脑裂闭环。
+		// =========================================================
+		observeCh := election.Observe(context.Background())
+		for {
+			select {
+			case <-session.Done():
+				fmt.Printf("\n⚠️ [%s] 租约丢失或 etcd 连接断开！本节点不再是 Leader，停止调度...\n", nodeID)
+				tw.Stop()
+				watcherCancel()
+				return
+			case resp := <-observeCh:
+				// 远端信号：leader key 每次变化都会推一条 GetResponse。
+				// ⚠️ Observe 可能先推一条"当前主还是我自己"，此时绝不能退出——
+				// 一退出就撤销租约、让位，会变成"当选即让位"的活锁。
+				// 只有确认"key 被删 / 主已被别人顶替"，才停止调度。
+				// ⚠️ 断连时库内部 Get 失败会 close(observeCh)（election.go 的 observe 协程），
+				// 从已关闭 channel 收到的是 nil，必须判空，否则 resp.Kvs 空指针 panic。
+				// 若真断连，session.Done() 也会触发，两条路径都汇到同一个"停"。
+				if resp == nil || len(resp.Kvs) == 0 || string(resp.Kvs[0].Value) != nodeID {
+					fmt.Printf("\n⚠️ [%s] 已被新 Leader 取代！本节点停止调度...\n", nodeID)
+					tw.Stop()
+					watcherCancel()
+					return
+				}
+			}
+		}
 	}()
 
 	// 6. 注册管理后台 API (提供给可视化网页调用)
+	// [架构修复 1] 不再传 ScheduleNotify：任务写入 etcd 后由 Leader 的 Watch 统一消费。
+	//   任意引擎（含 Standby）都能安全收写入，任务不会因"打到 Standby"而变孤儿。
 	jobApi := &api.JobAPI{
-		Store:          etcdStore,
-		// 【灵魂联动】前端调接口新增任务时，触发这个钩子，直接调用下面的 scheduleJob 函数进行热启动！
-		ScheduleNotify: scheduleJob, 
+		Store: etcdStore,
 	}
 	jobApi.RegisterRoutes()
 
@@ -150,8 +207,18 @@ func main() {
 }
 
 // fireOnce 纯粹的派发逻辑，打完仗就撤，绝不自循环（供正常触发和 Misfire 补偿复用）
-func fireOnce(job *store.JobInfo) {
+// slot: 本次触发的计划时间戳(Unix秒)，用于构造确定性执行 ID。
+// ⚠️ 必须由调用方显式传入，不能在函数内部读 job.NextTriggerTime —— 派发是异步的，
+//    内部读可能读到 scheduleJob 已改写好的"下一周期"值，执行 ID 就对不上了。
+func fireOnce(job *store.JobInfo, slot int64) {
 	fmt.Printf("\n[%s] ⚡ 任务触发！开始派发 -> %s\n", time.Now().Format("15:04:05"), job.ID)
+
+	// ⭐️ [架构修复 3] 确定性执行 ID = 任务ID + 触发时间戳 (例: 1834567890123456789:1723456789)
+	//    目的：让"旧主合法派发 slot N" 和 "新主 misfire 补偿 slot N" 算出同一个 ID，
+	//    Java 执行器按此 ID 原子去重，重复派发直接跳过 —— at-least-once 投递的兜底伞。
+	//    ⚠️ 必须确定性派生，绝不能用随机 UUID：随机 ID 两次派发不一样，执行器认不出重复。
+	execID := job.ID + ":" + strconv.FormatInt(slot, 10)
+	execParam, _ := json.Marshal(map[string]string{"executionId": execID})
 
 	aliveNodes := registry.GetAliveNodes(job.AppName)
 	if len(aliveNodes) == 0 {
@@ -176,19 +243,61 @@ func fireOnce(job *store.JobInfo) {
 				GlueType:        "BEAN",
 				BroadcastIndex:  s.BroadcastIndex,
 				BroadcastTotal:  s.BroadcastTotal,
+				// executionId 封装在 executorParams 里透传给 Java 执行器：
+				// xxl-job 的 TriggerParam 没有 executionId 字段，executorParams 是唯一透传通道，
+				// Java 端用 XxlJobHelper.getJobParam() 拿回来解析。
+				ExecutorParams: string(execParam),
 			}
 			if err := xxljob.Trigger(s.TargetIP, req); err != nil {
 				fmt.Printf("   -> 派发失败 (%s): %v\n", s.TargetIP, err)
 			} else {
-				fmt.Printf("   -> 🚀 成功击中目标 %s (分片 %d/%d)\n", s.TargetIP, s.BroadcastIndex, s.BroadcastTotal)
+				fmt.Printf("   -> 🚀 成功击中目标 %s (分片 %d/%d), 执行ID=%s\n", s.TargetIP, s.BroadcastIndex, s.BroadcastTotal, execID)
 			}
 		}(shard)
 	}
 }
 
+var (
+	// [架构修复 1 配套] 时间轮挂载去重表
+	//   jobID -> 已挂载的"未来触发点"(Unix秒字符串)。
+	//   Leader 通过 Watch 消费增量后，scheduleJob 会把算好的 NextTriggerTime 写回 etcd，
+	//   而 Leader 的 Watch 会收到自己写回的 Put → 再次进入 scheduleJob。
+	//   用 (jobID, 触发点) 判重：同一未来触发点已在轮子里就忽略，防止自旋重复挂载。
+	//   ⚠️ 不能只按 jobID 判重 —— 周期性任务每轮都会合法重排出新的触发点。
+	//   lastFired 额外挡住"触发点已到点消费、但写回事件延迟到达"的陈旧 Watch 事件。
+	wheelMu   sync.Mutex
+	inWheel   = make(map[string]string) // jobID -> 已挂载的未来触发点
+	lastFired = make(map[string]string) // jobID -> 最近一次已派发/已消费的触发点
+)
+
 // scheduleJob 核心魔法：算时间、塞入轮子、自动循环
-func scheduleJob(job *store.JobInfo) {
+// skipDedup: 仅 triggerFunc 里的"合法下一周期重排"传 true。
+//   此时 job 刚从轮子到点弹出，incoming 必然等于刚派发的 slot，
+//   若也走判重，会被 lastFired 误伤 → 周期性任务跑一次就死。跳过判重即可安全重排。
+func scheduleJob(job *store.JobInfo, skipDedup bool) {
 	now := time.Now().Unix()
+
+	// ⭐️ [架构修复 1 配套] 挂载去重
+	//    先取"进入调度时的触发点"，再决定是否挂载。
+	//    ⚠️ 必须在改写 NextTriggerTime 之前判重！否则 incoming 会读到新值，永远匹配不上。
+	key := job.ID
+	incoming := job.NextTriggerTime
+	incomingStr := strconv.FormatInt(incoming, 10)
+	if !skipDedup {
+		wheelMu.Lock()
+		if prev, ok := inWheel[key]; ok && prev == incomingStr {
+			wheelMu.Unlock()
+			fmt.Printf("   -> 任务 %s 触发点 %d 已在轮子中，忽略重复挂载\n", key, incoming)
+			return
+		}
+		// 该触发点已经被"到点派发"消费过，只是写回 etcd 的事件延迟到达 (陈旧事件)，忽略
+		if prev, ok := lastFired[key]; ok && prev == incomingStr {
+			wheelMu.Unlock()
+			fmt.Printf("   -> 任务 %s 触发点 %d 已派发过，忽略迟到的 Watch 事件\n", key, incoming)
+			return
+		}
+		wheelMu.Unlock()
+	}
 
 	// ⭐️ Misfire 漏发补偿机制 ⭐️
 	// 如果配置里存在预期的执行时间，而且当前时间已经超过了预期时间 (给 5 秒网络宽限期),因为延迟是常见的,不应把任何延迟视为漏发,所以我们给了一个5秒的宽限期,如果超过5秒就认为是漏发了
@@ -196,12 +305,16 @@ func scheduleJob(job *store.JobInfo) {
 		if job.NextTriggerTime < now-5 {
 			fmt.Printf("\n[Misfire 预警] 发现任务 %s 在宕机期间漏发！立即触发 [FIRE_ONCE_NOW] 补偿机制！\n", job.ID)
 			
-			// 独立开一个协程，立刻把漏掉的任务补发出去！(纯派发，不干扰后续正常的调度循环)
-			go fireOnce(job)
+			// ⭐️ [架构修复 3] 先同步快照"漏掉的那一次 slot"，再异步派发。
+			//    不能直接 go fireOnce(job, job.NextTriggerTime)：go 是异步的，
+			//    派发真正执行时 job.NextTriggerTime 可能已被下面的 scheduleJob 改写为下一周期值，
+			//    执行 ID 就对不上"旧主已派发"的 ID，Java 端去重失效。
+			missedSlot := job.NextTriggerTime
+			go fireOnce(job, missedSlot)
 		} else if job.NextTriggerTime <= now {
 			// TODO: 轻微迟到 (0~5秒内) 或刚好到期。目前代码会直接跳过当次执行，将其安排在下个周期。
-			// 按照大厂标准，这里应该和“没有延迟”一样，立刻触发当次执行，然后再算下一次的时间扔进时间轮。
-			// go fireOnce(job)
+			// 按照大厂标准，这里应该和”没有延迟”一样，立刻触发当次执行，然后再算下一次的时间扔进时间轮。
+			// go fireOnce(job, job.NextTriggerTime)
 		}
 	}
 
@@ -217,13 +330,25 @@ func scheduleJob(job *store.JobInfo) {
 	job.NextTriggerTime = time.Now().Add(delay).Unix()
 	go etcdStore.SaveJob(context.Background(), job)
 
+	// 记录本轮已挂载的触发点（供上面判重用）
+	wheelMu.Lock()
+	inWheel[key] = strconv.FormatInt(job.NextTriggerTime, 10)
+	wheelMu.Unlock()
+
 	// B. 定义这个任务“到点后真正要干的活”
 	var triggerFunc func()
 	triggerFunc = func() {
-		// 1. 打仗
-		fireOnce(job)
-		// 2. 灵魂自循环：重新排队！
-		scheduleJob(job)
+		// 0. 当前触发点已被消费：清挂载标记 + 记录已派发点。
+		//    清 inWheel 才能让下一周期合法重排；记 lastFired 让迟到的 Watch 陈旧事件被挡掉。
+		wheelMu.Lock()
+		delete(inWheel, key)
+		lastFired[key] = strconv.FormatInt(job.NextTriggerTime, 10)
+		wheelMu.Unlock()
+
+		// 1. 打仗 (同步取"当前引爆点"作为执行 ID 的一部分)
+		fireOnce(job, job.NextTriggerTime)
+		// 2. 灵魂自循环：重新排队！(skipDedup=true：这是合法的下一周期重排，不走判重)
+		scheduleJob(job, true)
 	}
 
 	// C. 正式把这个闭包函数，扔进时间轮排队

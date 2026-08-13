@@ -50,11 +50,11 @@ func TestEtcdStore(t *testing.T) {
 
 	// 5. 测试：【前缀扫描】(这是引擎宕机重启时，恢复整个时间轮状态的杀手锏)
 	t.Log(">>> 正在利用 WithPrefix 捞取全部任务...")
-	jobs, err := store.ListJobs(ctx)
+	jobs, rev, err := store.ListJobs(ctx)
 	if err != nil {
 		t.Fatalf("全量拉取失败: %v", err)
 	}
-	t.Logf("全量拉取成功！当前 etcd 内共有 %d 个 NanoJob 任务", len(jobs))
+	t.Logf("全量拉取成功！当前 etcd 内共有 %d 个 NanoJob 任务, 全局 Revision=%d", len(jobs), rev)
 
 	// 6. 测试：【删除】
 	t.Log(">>> 正在从 etcd 清理测试任务...")
