@@ -65,7 +65,7 @@ Numbers below come from `core/timewheel` microbenchmarks (**1ms tick**):
 
 | Metric | Measured | Scenario |
 | :--- | :--- | :--- |
-| Concurrent insert | 113 ns/op (~9.6M ops/s, 2 allocs/op) | 1ms tick × 3600 slots |
+| Concurrent insert | ~115 ns/op (~8.7M ops/s, 2 allocs/op) | 1ms tick × 3600 slots |
 | Scheduling precision | avg 4.1ms / p95 7.4ms / max 7.8ms deviation | 2000 tasks, uniform 2–4s delays |
 | Memory footprint | 1,000,000 tasks +53.5MB (56B/task) | 1ms tick × 3600 slots |
 | Trigger throughput | 50,000 tasks all fired in 3.5s, zero loss | uniform 0.5–3.5s delays |
