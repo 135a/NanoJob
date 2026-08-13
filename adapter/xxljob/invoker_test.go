@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 )
@@ -30,10 +29,9 @@ func TestTrigger(t *testing.T) {
 	}))
 	defer mockJavaServer.Close()
 
-	// 注意：mockJavaServer.URL 类似 "http://127.0.0.1:54321"，
-	// 但我们的 Trigger 函数内部会自动加 "http://" 和 "/run"，
-	// 所以我们需要把 "http://" 切掉，只传入 "127.0.0.1:54321" 这个格式的 targetIP
-	targetIP := strings.TrimPrefix(mockJavaServer.URL, "http://")
+	// mockJavaServer.URL 类似 "http://127.0.0.1:54321"。
+	// 协议约定：执行器地址是完整 URL（含 http://），Trigger 只负责追加 /run。
+	targetIP := mockJavaServer.URL
 
 	// 2. 组装要发送的测试任务
 	req := &RunReq{
