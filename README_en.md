@@ -21,6 +21,62 @@ A distributed job scheduling engine written in **Go**, backed by **MySQL + Redis
 | Trigger protocol | XXL-Job HTTP subset | `/run` trigger, `/api/callback` result callback, `/api/registry` heartbeat |
 | Job ID | MySQL auto-increment | Globally unique by construction (replaces Snowflake + WorkerID pool) |
 
+## Project mind map
+
+```mermaid
+mindmap
+  root((NanoJob scheduling engine))
+    What it is
+      Distributed job scheduling
+      XXL-Job protocol compatible
+      Learning project
+    Tech stack
+      Go 1.26+
+      MySQL storage
+      Redis coordination
+      xxl-job-core executors
+    Architecture
+      Storage layer
+        MySQL jobs triggers logs
+        Redis election lock + registry
+      Scheduling core
+        1s tick 60 slots
+        Cron parser
+        Single-target router
+      Election and registry
+        SETNX + TTL election
+        Heartbeat TTL registry
+      Protocol layer
+        /run trigger
+        /api/callback callback
+        /api/registry heartbeat
+      API and UI
+        Admin API
+        Dashboard
+    Core mechanisms
+      Redis leader election
+        Atomic SETNX lock
+        Lua value-check renewal
+        No split-brain
+      Write convergence
+        307 redirect
+        VerifyLeadership before write
+      Callback loop
+        Insert log first, get logId
+        Idempotent backfill by logId
+      Deterministic exec ID
+        jobID and slot
+        Atomic dedup in Java
+      Failover
+        New leader reloads
+        Skip missed, reschedule now
+    How to start
+      Docker Compose
+      Run from source
+      Seed job
+      Dashboard UI
+```
+
 ## Architecture
 
 ```
@@ -59,14 +115,24 @@ A distributed job scheduling engine written in **Go**, backed by **MySQL + Redis
 
 5. **Failover** — the new Leader loads all jobs from MySQL and remounts the wheel. A missed fire (previous trigger point already in the past) is **skipped and rescheduled from now** — deterministic, no misfire compensation.
 
-## Quick start
+## Startup
 
 ### Prerequisites
 
 - Go 1.26+
 - MySQL 8+ and Redis (single instance is enough)
 
-### 1. Docker Compose (MySQL + Redis + 3 engines)
+### Environment variables (optional, needed for multi-engine setups)
+
+Config is driven by `conf.json`; these variables **override** key fields (docker-compose gives each engine a distinct identity this way):
+
+| Env var | Overrides | Notes |
+| :--- | :--- | :--- |
+| `NANOJOB_DSN` | `mysql.dsn` | MySQL DSN (which database to connect to) |
+| `NANOJOB_REDIS_ADDR` | `redis.addr` | Redis address (shared by election lock + registry) |
+| `NANOJOB_ADVERTISE_ADDR` | `api_server.http.advertise_addr` | This node's public address = election-lock value + redirect target; **must differ across engines** |
+
+### Option A: Docker Compose (MySQL + Redis + 3 engines)
 
 ```bash
 docker-compose up -d
@@ -76,28 +142,53 @@ Brings up MySQL (3306), Redis (6379), and three Go engines (8081/8082/8083). Sto
 
 > Engines talk to each other via container service names (`nanojob1:8080`). To exercise the browser redirect, set `NANOJOB_ADVERTISE_ADDR` to a `localhost:<mapped-port>` address.
 
-### 2. Run from source
+### Option B: Run from source
 
 ```bash
-# create the database first:
-#   mysql -uroot -p123456 -e "CREATE DATABASE IF NOT EXISTS nanojob DEFAULT CHARSET utf8mb4;"
-
+# Single engine (database and tables are created automatically)
 go run ./cmd/nanojob/main.go -c conf.json
+
+# Three engines locally: one terminal each, vary the port + advertise_addr
+NANOJOB_ADVERTISE_ADDR=http://127.0.0.1:9090 go run ./cmd/nanojob/main.go -c conf.json
+NANOJOB_ADVERTISE_ADDR=http://127.0.0.1:9091 go run ./cmd/nanojob/main.go -c conf.json
 ```
 
-Tables are created automatically at startup.
+On startup the engine (1) creates the `nanojob` database if missing (name taken from `mysql.dsn`), and (2) ensures the `nanojob_job` / `nanojob_log` tables exist (`CREATE TABLE IF NOT EXISTS`, idempotent). The DDL lives as standalone `.sql` files under `core/store/sql/`, embedded into the binary via `go:embed`.
 
-### 3. Seed a demo job
+### Seed a demo job
 
 ```bash
 go run ./cmd/seed/main.go     # inserts a job that fires every 10 seconds
 ```
 
-### 4. Web dashboard
+### Web dashboard
 
 Open `ui/index.html` directly in a browser (talks to `http://localhost:8080/api` over CORS). Shows each job's next-fire-time and execution logs.
 
-### 5. Java executor integration
+### Verify the core loop (curl)
+
+```bash
+# 1. Simulate an executor heartbeat → registers in Redis (auto-evicted after TTL 90s)
+curl -X POST http://127.0.0.1:8080/api/registry \
+  -d '{"registryGroup":"EXECUTOR","registryKey":"loan-service","registryValue":"192.168.1.100:9999"}'
+
+# 2. Add a job (writes converge to the Leader; returns the auto-increment id)
+curl -X POST http://127.0.0.1:8080/api/job/add \
+  -H 'Content-Type: application/json' \
+  -d '{"cron":"0/10 * * * * ?","executorHandler":"loanInterestJobHandler","appName":"loan-service"}'
+
+# 3. List jobs (with next-fire-time)
+curl http://127.0.0.1:8080/api/job/list
+
+# 4. Simulate the Java callback → backfills that execution's log result (grab logId from the log list)
+curl -X POST http://127.0.0.1:8080/api/callback \
+  -d '[{"logId":1,"logDateTim":1700000000000,"handleCode":200,"handleMsg":"ok"}]'
+
+# 5. List execution logs (handleCode: 0=running / 200=ok / 500=failed)
+curl 'http://127.0.0.1:8080/api/job/logs?id=1'
+```
+
+### Java executor integration
 
 ```yaml
 xxl:
@@ -110,13 +201,24 @@ xxl:
 
 See `examples/java-executor` (Spring Boot + xxl-job-core, includes the `ExecutionDedup` demo). The executor must report heartbeats to `/registry`.
 
+### Troubleshooting
+
+| Symptom | Where to look |
+| :--- | :--- |
+| Startup fails to connect MySQL | MySQL not running, or `mysql.dsn` user/password/port wrong in `conf.json` |
+| Startup fails to connect Redis | Redis not running, or `redis.addr` wrong |
+| No leader is ever elected | Redis down, or all engines share the same `advertise_addr` (lock-value conflict) |
+| Jobs not dispatched / logs stuck at "running" | No live executor under that AppName (no heartbeat to `/api/registry`) |
+| Adding a job from the browser fails | Write landed on a Standby and the redirect target is unreachable (container service name — see Option A note) |
+| Port `8080` taken | Change `port` in `conf.json` and the port inside `advertise_addr` accordingly |
+
 ## Directory layout
 
 ```
 cmd/nanojob/               engine entrypoint (config, election, API wiring)
 cmd/seed/                  MySQL seed job injector
 core/timewheel/            single-level time wheel (tick + circle counting)
-core/store/                MySQL persistence (jobs + logs, auto DDL)
+core/store/                MySQL persistence (jobs + logs; sql/ holds the DDL files, go:embed)
 core/registry/             executor heartbeat registry (Redis TTL, 90s)
 core/election/             Redis SETNX+TTL election (Lua value-check renewal)
 core/scheduler/            scheduling core (wheel, dispatch, logs, callbacks)

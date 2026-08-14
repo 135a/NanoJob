@@ -23,6 +23,62 @@ NanoJob 用 Go 从零实现了分布式任务调度的核心链路，砍掉了�
 
 > 定位：学习分布式调度、Redis 选主、写收敛与容错设计。存储层（MySQL/Redis）暂为单实例，应用层多副本 HA。
 
+## 项目思维导图
+
+```mermaid
+mindmap
+  root((NanoJob 分布式调度引擎))
+    定位
+      分布式任务调度
+      XXL-Job 协议兼容
+      学习型项目
+    技术栈
+      Go 1.26+
+      MySQL 存储
+      Redis 协调
+      xxl-job-core 执行器
+    架构分层
+      存储层
+        MySQL 任务 触发 日志
+        Redis 选主锁 注册表
+      调度内核
+        时间轮 1s 滴答 60 槽
+        Cron 解析器
+        单目标路由
+      选举与注册
+        SETNX + TTL 选主
+        心跳 TTL 注册表
+      协议层
+        /run 触发
+        /api/callback 回调
+        /api/registry 心跳
+      API 与 UI
+        管理 API
+        控制台大盘
+    核心机制
+      Redis 选主
+        SETNX 原子抢锁
+        Lua 值校验续期
+        防双主脑裂
+      写收敛 Leader
+        307 重定向
+        写前校验锁
+      回调闭环
+        先落库拿 logId
+        按 logId 幂等回填
+      确定性执行 ID
+        jobID 与 slot
+        Java 侧原子去重
+      故障转移
+        新 Leader 重载
+        错过即重排
+    启动方式
+      Docker Compose
+      源码启动
+      种子任务
+      控制台 UI
+```
+
 ## 架构
 
 ```
@@ -78,14 +134,24 @@ NanoJob 用 Go 从零实现了分布式任务调度的核心链路，砍掉了�
 
 新 Leader 当选后从 MySQL 全量加载任务挂进时间轮。错过的一次触发（原触发点已在过去）**直接跳过、从当前时刻重排**，行为可预期，不再补偿。
 
-## 快速启动
+## 启动方法
 
 ### 准备
 
 - Go 1.26+
 - MySQL 8+ 与 Redis（单实例即可）
 
-### 1. Docker Compose（MySQL + Redis + 3 引擎）
+### 环境变量（可选，多引擎差异化时用）
+
+配置以 `conf.json` 为基准，以下环境变量可**覆盖**关键字段（docker-compose 三引擎就是靠它让每台引擎互不相同）：
+
+| 环境变量 | 覆盖的配置字段 | 说明 |
+| :--- | :--- | :--- |
+| `NANOJOB_DSN` | `mysql.dsn` | MySQL 连接串（连哪台库） |
+| `NANOJOB_REDIS_ADDR` | `redis.addr` | Redis 地址（选主锁 + 注册表共用） |
+| `NANOJOB_ADVERTISE_ADDR` | `api_server.http.advertise_addr` | 本节点对外地址 = 选主锁持有值 + 重定向目标，**多引擎必须各不相同** |
+
+### 方式一：Docker Compose（MySQL + Redis + 3 引擎）
 
 ```bash
 docker-compose up -d
@@ -95,32 +161,53 @@ docker-compose up -d
 
 **注意**：引擎之间用容器服务名互通（如 `nanojob1:8080`）。浏览器访问 `localhost:8081~8083` 时，若写请求落在 Standby，重定向 Location 是容器内地址、浏览器解析不了 —— 想从浏览器验证"重定向"效果，把对应引擎的 `NANOJOB_ADVERTISE_ADDR` 改成 `http://localhost:<映射端口>` 即可。
 
-### 2. 源码启动
+### 方式二：源码启动
 
 ```bash
-# 先建库 (引擎不会自动建库):
-#   mysql -uroot -p123456 -e "CREATE DATABASE IF NOT EXISTS nanojob DEFAULT CHARSET utf8mb4;"
-
-# 单引擎
+# 单引擎（库和表都不用手动建 —— 引擎启动时自举建库 + 建表）
 go run ./cmd/nanojob/main.go -c conf.json
 
-# 三引擎本地演示: 各自改 conf.json 的 port + advertise_addr (或设环境变量)
+# 三引擎本地演示：各开一个终端，改端口 + advertise_addr
 NANOJOB_ADVERTISE_ADDR=http://127.0.0.1:9090 go run ./cmd/nanojob/main.go -c conf.json
+NANOJOB_ADVERTISE_ADDR=http://127.0.0.1:9091 go run ./cmd/nanojob/main.go -c conf.json
 ```
 
-引擎启动时自动建表（`nanojob_job` / `nanojob_log`）。
+引擎启动时自动做两件事：① 若 `nanojob` 库不存在则创建（库名取自 `mysql.dsn`）；② 确保 `nanojob_job` / `nanojob_log` 两表存在（`CREATE TABLE IF NOT EXISTS`，幂等）。建库建表 SQL 以独立 `.sql` 文件管理在 `core/store/sql/` 下，随二进制 `go:embed` 嵌入。
 
-### 3. 注入种子任务
+### 注入种子任务
 
 ```bash
-go run ./cmd/seed/main.go          # 向 MySQL 插入一条每 10 秒触发的演示任务
+go run ./cmd/seed/main.go    # 向 MySQL 插入一条每 10 秒触发的演示任务
 ```
 
-### 4. 可视化大盘
+### 可视化大盘
 
 引擎不托管静态页面。双击打开 `ui/index.html`（通过 `http://localhost:8080/api` + CORS 读写），可新增任务、查看每行任务的**下次触发时间**与**执行日志**。
 
-### 5. Java 执行器接入
+### 验证核心链路（curl）
+
+```bash
+# ① 模拟执行器心跳 → 注册进 Redis（TTL 90s 自动摘除）
+curl -X POST http://127.0.0.1:8080/api/registry \
+  -d '{"registryGroup":"EXECUTOR","registryKey":"loan-service","registryValue":"192.168.1.100:9999"}'
+
+# ② 新增任务（写请求收敛到 Leader，落地后返回自增 id）
+curl -X POST http://127.0.0.1:8080/api/job/add \
+  -H 'Content-Type: application/json' \
+  -d '{"cron":"0/10 * * * * ?","executorHandler":"loanInterestJobHandler","appName":"loan-service"}'
+
+# ③ 查任务列表（含下次触发时间）
+curl http://127.0.0.1:8080/api/job/list
+
+# ④ 模拟 Java 跑完回调 → 回填该次执行日志结果（logId 从日志列表里取）
+curl -X POST http://127.0.0.1:8080/api/callback \
+  -d '[{"logId":1,"logDateTim":1700000000000,"handleCode":200,"handleMsg":"ok"}]'
+
+# ⑤ 查执行日志（handleCode：0=运行中 / 200=成功 / 500=失败）
+curl 'http://127.0.0.1:8080/api/job/logs?id=1'
+```
+
+### Java 执行器接入
 
 实现的是 XXL-Job 执行器协议核心子集，基于 xxl-job-core 的客户端可以直接接入：
 
@@ -135,13 +222,24 @@ xxl:
 
 示例执行器在 `examples/java-executor`（Spring Boot + xxl-job-core，含 ExecutionDedup 幂等 demo），需向引擎 `/registry` 上报心跳。
 
+### 常见问题
+
+| 症状 | 排查方向 |
+| :--- | :--- |
+| 启动报 `连接 MySQL 失败` | MySQL 未启动，或 `conf.json` 的 `mysql.dsn` 账号/密码/端口不对 |
+| 启动报 `无法连接 Redis` | Redis 未启动，或 `redis.addr` 不对 |
+| 一直选不出主 | Redis 没起，或多引擎 `advertise_addr` 相同导致锁值冲突 |
+| 任务不派发、日志停在"运行中" | 该 AppName 下没有活着的执行器（没心跳进 `/api/registry`） |
+| 浏览器新增任务失败 | 写请求落到 Standby 且重定向地址不可达（容器服务名，见方式一注意） |
+| `8080` 端口被占 | 改 `conf.json` 的 `port`，并同步改 `advertise_addr` 里的端口 |
+
 ## 目录结构
 
 ```
 cmd/nanojob/              引擎入口 (config 加载、Redis 选主、API 装配)
 cmd/seed/                 MySQL 种子任务注入
 core/timewheel/           单层时间轮 (tick + 圈数计数)
-core/store/               MySQL 持久化 (任务 + 日志, 自动建表)
+core/store/               MySQL 持久化 (任务 + 日志; sql/ 独立管理建库建表 DDL, go:embed 嵌入)
 core/registry/            执行器心跳注册 (Redis TTL, 90s 自动摘除)
 core/election/            Redis SETNX+TTL 自研选主 (Lua 值校验续期)
 core/scheduler/           调度核心 (挂轮子、派发、落日志、回调驱动)

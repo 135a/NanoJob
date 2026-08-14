@@ -3,11 +3,19 @@ package store
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
+
+// go:embed sql/*.sql 把建库建表 DDL 打进二进制, 引擎启动时自动执行。
+// SQL 以独立 .sql 文件管理 (可读可改可 diff), 不再散落在 Go 字符串里 (解耦)。
+//
+//go:embed sql/*.sql
+var sqlFS embed.FS
 
 // MySQLStore MySQL 实现的持久层, 同时承载任务配置与执行日志。
 // 相比 etcd: 存储层单点, 但应用层多副本 HA, 无需 Raft 协调成本。
@@ -18,7 +26,14 @@ type MySQLStore struct {
 // NewMySQLStore 连接 MySQL。dsn 形如:
 //
 //	"root:123456@tcp(127.0.0.1:3306)/nanojob?charset=utf8mb4&parseTime=true"
+//
+// 先自举建库: 库可能还不存在, 先用去掉库名的 DSN 连一次服务器执行建库 SQL,
+// 再以完整 DSN 连接。这让源码启动也"开箱即用", 不必手动执行建库命令。
 func NewMySQLStore(dsn string) (*MySQLStore, error) {
+	if err := ensureDatabase(dsn); err != nil {
+		return nil, err
+	}
+
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("打开 MySQL 失败: %v", err)
@@ -33,37 +48,85 @@ func NewMySQLStore(dsn string) (*MySQLStore, error) {
 	return &MySQLStore{db: db}, nil
 }
 
-// EnsureTables 幂等建表 (任务配置 + 执行日志)。
+// ensureDatabase 自举建库: 库不存在时, 用去掉库名的 DSN 连一次服务器, 执行 sql/001 的建库 SQL。
+// 库名从 DSN 解析并替换 SQL 里的 {database} 占位符, 保证与 conf.json 配置一致。
+func ensureDatabase(dsn string) error {
+	ddl, err := sqlFS.ReadFile("sql/001_create_database.sql")
+	if err != nil {
+		return fmt.Errorf("读取建库 SQL 失败: %v", err)
+	}
+
+	dbName := dsnDatabase(dsn)
+	if dbName == "" {
+		return fmt.Errorf("DSN 中缺少库名, 无法自举建库: %s", dsn)
+	}
+	stmt := strings.ReplaceAll(string(ddl), "{database}", dbName)
+
+	// 不带库名连服务器 (库还不存在, 带库名会连不上)
+	boot, err := sql.Open("mysql", dsnWithoutDatabase(dsn))
+	if err != nil {
+		return fmt.Errorf("打开 MySQL 自举连接失败: %v", err)
+	}
+	defer boot.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := boot.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("自举建库失败 (库 %s): %v", dbName, err)
+	}
+	return nil
+}
+
+// dsnDatabase 从 DSN 解析库名: "user:pass@tcp(host:port)/dbname?params" → "dbname"
+func dsnDatabase(dsn string) string {
+	i := strings.LastIndex(dsn, "/")
+	if i < 0 {
+		return ""
+	}
+	rest := dsn[i+1:]
+	if j := strings.Index(rest, "?"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// dsnWithoutDatabase 去掉 DSN 里的库名段 (连服务器但不选库):
+// "user:pass@tcp(host:port)/dbname?params" → "user:pass@tcp(host:port)/?params"
+func dsnWithoutDatabase(dsn string) string {
+	i := strings.LastIndex(dsn, "/")
+	if i < 0 {
+		return dsn
+	}
+	if j := strings.Index(dsn[i:], "?"); j >= 0 {
+		return dsn[:i+1] + dsn[i+j:]
+	}
+	return dsn[:i+1]
+}
+
+// splitStatements 按分号切分 SQL 文件为单条语句, 忽略空串。
+// 本项目 DDL 无内嵌分号, 简单切分足够; 含 -- 注释行也能整体执行 (MySQL 忽略注释)。
+func splitStatements(ddl string) []string {
+	var stmts []string
+	for _, s := range strings.Split(ddl, ";") {
+		if s = strings.TrimSpace(s); s != "" {
+			stmts = append(stmts, s)
+		}
+	}
+	return stmts
+}
+
+// EnsureTables 幂等建表 (任务配置 + 执行日志): 读取嵌入的 sql/002_create_tables.sql 逐条执行。
+// IF NOT EXISTS 保证重复启动无副作用。只建表不迁移, 加字段需另行编写 ALTER (README 已知限制)。
 func (s *MySQLStore) EnsureTables(ctx context.Context) error {
-	if _, err := s.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS nanojob_job (
-			id                BIGINT AUTO_INCREMENT PRIMARY KEY,
-			cron              VARCHAR(64)  NOT NULL,
-			executor_handler  VARCHAR(128) NOT NULL,
-			app_name          VARCHAR(64)  NOT NULL,
-			next_trigger_time BIGINT       NOT NULL DEFAULT 0,
-			created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`); err != nil {
-		return fmt.Errorf("建 nanojob_job 表失败: %v", err)
+	ddl, err := sqlFS.ReadFile("sql/002_create_tables.sql")
+	if err != nil {
+		return fmt.Errorf("读取建表 SQL 失败: %v", err)
 	}
-
-	if _, err := s.db.ExecContext(ctx, `
-		CREATE TABLE IF NOT EXISTS nanojob_log (
-			id               BIGINT AUTO_INCREMENT PRIMARY KEY,
-			job_id           BIGINT       NOT NULL,
-			app_name         VARCHAR(64)  NOT NULL DEFAULT '',
-			executor_handler VARCHAR(128) NOT NULL DEFAULT '',
-			exec_id          VARCHAR(128) NOT NULL DEFAULT '',
-			trigger_time     BIGINT       NOT NULL DEFAULT 0,
-			trigger_ip       VARCHAR(128) NOT NULL DEFAULT '',
-			handle_code      INT          NOT NULL DEFAULT 0,
-			handle_msg       TEXT,
-			callback_time    BIGINT       NOT NULL DEFAULT 0
-		) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`); err != nil {
-		return fmt.Errorf("建 nanojob_log 表失败: %v", err)
+	for _, stmt := range splitStatements(string(ddl)) {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("执行建表 SQL 失败: %v", err)
+		}
 	}
-
 	return nil
 }
 
