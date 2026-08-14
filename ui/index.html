@@ -268,7 +268,7 @@
         <div class="header-actions">
             <div>
                 <h1>任务大盘</h1>
-                <p class="subtitle">实时监控 etcd 分布式任务队列与内存时间轮状态</p>
+                <p class="subtitle">实时监控 MySQL 任务队列、下次触发与执行日志</p>
             </div>
             <button class="btn-primary" onclick="openModal()">+ 新建定时任务</button>
         </div>
@@ -281,14 +281,15 @@
                         <th>执行类名 (Handler)</th>
                         <th>业务分组 (AppName)</th>
                         <th>触发规则 (Cron)</th>
-                        <th>路由策略</th>
+                        <th>下次触发</th>
                         <th>状态</th>
+                        <th>操作</th>
                     </tr>
                 </thead>
                 <tbody id="jobTableBody">
                     <!-- 数据将由 JS 动态渲染 -->
                     <tr>
-                        <td colspan="6" style="text-align: center; color: var(--text-muted);">正在连接调度引擎...</td>
+                        <td colspan="7" style="text-align: center; color: var(--text-muted);">正在连接调度引擎...</td>
                     </tr>
                 </tbody>
             </table>
@@ -320,6 +321,19 @@
         </div>
     </div>
 
+    <!-- 执行日志弹窗 (回调闭环的展示侧) -->
+    <div class="modal-overlay" id="logModal">
+        <div class="modal" style="width: 700px;">
+            <h2 id="logModalTitle">执行日志</h2>
+            <div id="logContent" style="max-height: 400px; overflow-y: auto; font-size: 0.85rem;">
+                加载中...
+            </div>
+            <div class="modal-actions">
+                <button type="button" class="btn-cancel" onclick="closeLogModal()">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const API_BASE = 'http://localhost:8080/api';
 
@@ -346,28 +360,63 @@
 
                 if (res.code === 200 && res.data) {
                     if (res.data.length === 0) {
-                        tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#94a3b8">暂无任务，点击右上角新建</td></tr>';
+                        tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#94a3b8">暂无任务，点击右上角新建</td></tr>';
                         return;
                     }
                     
                     res.data.forEach(job => {
                         const tr = document.createElement('tr');
+                        const nextT = job.nextTriggerTime > 0 ? new Date(job.nextTriggerTime * 1000).toLocaleString() : '—';
                         tr.innerHTML = `
                             <td style="font-weight: 500; color: #fff">${job.id}</td>
                             <td style="color: var(--accent-blue)">@XxlJob("${job.executorHandler}")</td>
                             <td><span style="background: rgba(129, 140, 248, 0.2); color: var(--accent-purple); padding: 4px 10px; border-radius: 20px; font-size: 0.8rem">${job.appName}</span></td>
                             <td style="font-family: monospace; letter-spacing: 1px">${job.cron}</td>
-                            <td>${job.strategy}</td>
-                            <td><span class="status-dot"></span>倒计时中</td>
+                            <td style="font-size: 0.85rem; color: #cbd5e1">${nextT}</td>
+                            <td><span class="status-dot"></span>已挂载</td>
+                            <td><a href="javascript:void(0)" onclick="viewLogs(${job.id})" style="color: var(--accent-blue)">日志</a></td>
                         `;
                         tbody.appendChild(tr);
                     });
                 }
             } catch (error) {
                 console.error("请求失败", error);
-                document.getElementById('jobTableBody').innerHTML = 
-                    '<tr><td colspan="6" style="text-align:center;color:var(--danger)">无法连接到 Go 调度引擎，请确保 main.go 已在 8080 端口启动。</td></tr>';
+                document.getElementById('jobTableBody').innerHTML =
+                    '<tr><td colspan="7" style="text-align:center;color:var(--danger)">无法连接到 Go 调度引擎，请确保引擎已在 8080 端口启动。</td></tr>';
             }
+        }
+
+        // 查看某个任务的执行日志 (来自 Java 执行器的 /api/callback 回填)
+        async function viewLogs(jobId) {
+            document.getElementById('logModal').classList.add('active');
+            document.getElementById('logModalTitle').textContent = `执行日志 - 任务 #${jobId}`;
+            document.getElementById('logContent').innerHTML = '加载中...';
+            try {
+                const resp = await fetch(`${API_BASE}/job/logs?id=${jobId}`);
+                const res = await resp.json();
+                const box = document.getElementById('logContent');
+                if (res.code !== 200 || !res.data || res.data.length === 0) {
+                    box.innerHTML = '<p style="color:#94a3b8">暂无执行日志</p>';
+                    return;
+                }
+                const statusText = (c) => c === 0 ? '🔄 运行中' : (c === 200 ? '✅ 成功' : '❌ 失败');
+                box.innerHTML = res.data.map(l => `
+                    <div style="border-bottom: 1px solid var(--border-color); padding: 10px 0;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <span style="color:#e2e8f0">#${l.id} ${statusText(l.handleCode)}</span>
+                            <span style="color:var(--text-muted); font-size:0.8rem">${new Date(l.triggerTime * 1000).toLocaleString()}</span>
+                        </div>
+                        <div style="color:var(--text-muted); margin-top:4px;">执行器: ${l.triggerIp} · execId: ${l.execId}</div>
+                        <div style="color:#94a3b8; margin-top:4px; white-space:pre-wrap; font-family:monospace;">${l.handleMsg || ''}</div>
+                    </div>
+                `).join('');
+            } catch (e) {
+                document.getElementById('logContent').innerHTML = '<p style="color:var(--danger)">日志查询失败</p>';
+            }
+        }
+
+        function closeLogModal() {
+            document.getElementById('logModal').classList.remove('active');
         }
 
         // 提交表单添加新任务
@@ -375,11 +424,10 @@
             e.preventDefault(); // 阻止页面刷新
             
             const payload = {
-                // ID 不再由前端输入，而是由后端雪花算法自动生成
+                // ID 由后端 MySQL 自增生成, 无需前端传
                 cron: document.getElementById('jobCron').value,
                 executorHandler: document.getElementById('jobHandler').value,
-                appName: document.getElementById('jobAppName').value,
-                strategy: "SHARDING" // 目前为了演示统一使用分片策略
+                appName: document.getElementById('jobAppName').value
             };
 
             const btn = e.target.querySelector('button[type="submit"]');

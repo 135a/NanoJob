@@ -1,0 +1,18 @@
+{
+  "cluster_name": "nanojob",
+  "mysql": {
+    "dsn": "root:123456@tcp(127.0.0.1:3306)/nanojob?charset=utf8mb4&parseTime=true"
+  },
+  "redis": {
+    "addr": "127.0.0.1:6379",
+    "password": "",
+    "db": 0
+  },
+  "api_server": {
+    "http": {
+      "host": "0.0.0.0",
+      "port": "8080",
+      "advertise_addr": "http://127.0.0.1:8080"
+    }
+  }
+}

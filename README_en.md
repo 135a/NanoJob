@@ -1,155 +1,155 @@
 # NanoJob
 
-A distributed job scheduling engine written in **Go**, coordinated by **etcd**, with core protocol compatibility with **XXL-Job** executors.
+A distributed job scheduling engine written in **Go**, backed by **MySQL + Redis**, with core protocol compatibility with **XXL-Job** executors.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Language-Go-00ADD8.svg" alt="Language">
-  <img src="https://img.shields.io/badge/Coordination-etcd-blue.svg" alt="etcd">
+  <img src="https://img.shields.io/badge/Storage-MySQL-4479A1.svg" alt="MySQL">
+  <img src="https://img.shields.io/badge/Coordination-Redis-DC382D.svg" alt="Redis">
   <img src="https://img.shields.io/badge/Compatibility-XXL--Job-important.svg" alt="XXL-Job">
 </p>
 
-> **Status: learning project.** Built to study distributed scheduling, etcd coordination, and fault-tolerance design. Not production-grade; several limitations are listed below.
+> **Status: learning project.** Built to study distributed scheduling, Redis leader election, write convergence, and fault tolerance. Storage (MySQL/Redis) is single-instance; app-layer engines are HA replicas.
 
 ## Overview
 
 | Layer | Implementation | Notes |
 | :--- | :--- | :--- |
-| Storage & coordination | etcd | Job persistence, leader election, executor heartbeat registry (Lease, 90s TTL auto-eviction) |
-| Scheduling core | Single-level in-memory time wheel + circle counting | O(1) insertion (mutex-protected); engine runs at **1s tick × 60 slots** |
-| Trigger protocol | XXL-Job HTTP subset | Executor `/run` trigger + `/registry` heartbeat registration |
-| Job ID | Snowflake | Worker ID atomically claimed via etcd Txn (1–1023) |
+| Storage | MySQL | Job config, next-fire-time, execution logs (`nanojob_job` / `nanojob_log`) |
+| Election & registry | Redis | SETNX + TTL custom lock for leader election; executor heartbeat `SET key EX 90` auto-eviction |
+| Scheduling core | Single-level in-memory time wheel + circle counting | 1s tick × 60 slots, runs **on the Leader only** |
+| Trigger protocol | XXL-Job HTTP subset | `/run` trigger, `/api/callback` result callback, `/api/registry` heartbeat |
+| Job ID | MySQL auto-increment | Globally unique by construction (replaces Snowflake + WorkerID pool) |
 
-## Core mechanisms (three distributed-systems bugs fixed)
+## Architecture
 
-### 1. Unified Watch consumption — fixes "orphan jobs"
-
-**Problem**: previously a job was hot-loaded for scheduling on whichever engine received the write. A request that hit a Standby node (never elected, time wheel never started) left the job persisted but never scheduled — an orphan.
-
-**Fix**: scheduling is centralized on the Leader. Any engine (including Standby) only writes the job to etcd; the Leader consumes all incremental writes through etcd Watch. To close the race window between `ListJobs` and `Watch`, it uses **read-then-watch**:
-
-1. `ListJobs(ctx)` returns existing jobs **and** the etcd global `revision`;
-2. `WatchJobs(rev+1)` starts watching from the next revision;
-3. each Watch event is mounted via `scheduleJob`, deduplicated by `(jobID, trigger point)` to avoid re-mounting the Leader's own `NextTriggerTime` write-back (spin loop).
-
-### 2. Fail-fast leadership loss — fixes "split-brain"
-
-**Problem**: the old code spun on `select {}` after winning the election and never checked the lease. A disconnected old Leader kept dispatching like a zombie alongside the new Leader = split-brain (duplicate triggers).
-
-**Fix**: watch two complementary signals and stop scheduling the moment leadership is confirmed lost:
-
-- `session.Done()` — local signal (etcd connection lost / lease revoked), still fires when etcd is unreachable;
-- `election.Observe()` — remote signal (leader key deleted / replaced by a new Leader).
-
-On either signal: `tw.Stop()` (stop the wheel) + `watcherCancel()` (stop the watcher) + return; `defer session.Close()` revokes the lease so a Standby can take over cleanly.
-
-⚠️ Implementation detail: `Observe` may first push "I'm still the leader" — exiting on that would create a "win-then-immediately-yield" live-lock, so a loop exits only when the key is gone or holds a different node ID. On disconnect the library closes the channel internally and a closed-channel receive yields `nil` — guard against nil before touching `resp.Kvs` to avoid a panic.
-
-### 3. Deterministic execution ID + executor idempotency — fixes "handover duplicate"
-
-**Problem**: the delivery contract is at-least-once. The old leader legitimately dispatched slot N, then lost connectivity; the new leader can't know whether it was dispatched, so it compensates as a missed fire → slot N dispatched twice. This is structural in distributed systems and cannot be fully removed at the scheduler layer.
-
-**Fix**: the engine generates a **deterministic execution ID** = `jobID:triggerTimestamp` (e.g. `1834567890123456789:1723456789`), passed via `executorParams`; the Java executor atomically claims it before running:
-
-- Go `fireOnce`: `execID = jobID + ":" + slot`, marshaled as `{"executionId": execID}` into `RunReq.ExecutorParams`;
-- Java `ExecutionDedup.tryClaim()`: parses the ID from `XxlJobHelper.getJobParam()` and claims it with `ConcurrentHashMap.putIfAbsent`; a failed claim means a duplicate dispatch → skip.
-
-Key points:
-
-- the exec ID must be **deterministically derived** (never a random UUID), otherwise two dispatches yield different IDs and the executor can't recognize the duplicate;
-- the `slot` must be **snapshotted synchronously** before async dispatch (especially in misfire compensation), otherwise the async goroutine reads `job.NextTriggerTime` after it has been advanced to the next period;
-- the demo dedup table is in-process only (single JVM); multi-instance deployments need shared storage (MySQL unique index / Redis SETNX).
-
-## Benchmarks (measured on this machine)
-
-Numbers below come from `core/timewheel` microbenchmarks (**1ms tick**):
-
-| Metric | Measured | Scenario |
-| :--- | :--- | :--- |
-| Concurrent insert | ~115 ns/op (~8.7M ops/s, 2 allocs/op) | 1ms tick × 3600 slots |
-| Scheduling precision | avg 4.1ms / p95 7.4ms / max 7.8ms deviation | 2000 tasks, uniform 2–4s delays |
-| Memory footprint | 1,000,000 tasks +53.5MB (56B/task) | 1ms tick × 3600 slots |
-| Trigger throughput | 50,000 tasks all fired in 3.5s, zero loss | uniform 0.5–3.5s delays |
-| Statement coverage | 100% | full Go test suite green |
-
-⚠️ **Important**: the millisecond precision and sub-microsecond inserts come from a **1ms-tick microbenchmark**. The engine runs at a **1s tick × 60 slots**, so real trigger granularity is ~1 second. Don't present the microbenchmark numbers as production accuracy.
-
-Reproduce:
-
-```bash
-go test ./core/timewheel/ -run 'TestSchedulingPrecision|TestTriggerThroughput|TestMemoryFootprint' -v
-go test ./core/timewheel/ -bench BenchmarkTimeWheelAdd -benchtime=1s -run '^$'
 ```
+              Frontend (ui/index.html, any engine address)
+                       │ writes
+                       ▼
+        ┌───────────────────────────────┐
+        │  Go engine cluster (HA)       │
+        │  Leader: time wheel + writes  │
+        │  Standby: 307-redirect writes │
+        │          to the Leader        │
+        └──────┬───────────────┬─────────┘
+               │               │
+       ┌───────▼─────┐   ┌─────▼──────────┐
+       │ MySQL       │   │ Redis          │
+       │ jobs+logs   │   │ lock+registry  │
+       └─────────────┘   └────────────────┘
+               ▲
+               │ /run trigger + executionId idempotency
+               │ POST /api/callback with the result
+        ┌──────┴──────────┐
+        │ Java executors  │
+        │ (xxl-job-core)  │
+        └─────────────────┘
+```
+
+### Core mechanisms
+
+1. **Redis leader election** — `SET key <nodeID> NX EX 5` is atomic acquisition; the Leader renews the TTL through a Lua script that **re-validates the current value** (only renew if the key still holds its own ID), so a disconnected old leader can never renew alongside the new one (split-brain). The lock value doubles as the Leader's advertised address for redirects.
+
+2. **Write convergence (etcd Watch and the 3-layer dedup removed)** — the Leader persists and mounts new jobs directly; a Standby receiving a write replies **307 to the Leader**, and the browser `fetch` follows with the body intact. Right before writing, the Leader calls `VerifyLeadership()` (one more Redis GET) to cover the gap between the check and the write.
+
+3. **Callback loop (`/api/callback` + `nanojob_log`)** — before triggering, the engine inserts a "running" log row and passes `LogID`/`LogDateTime` in `RunReq`; after the job finishes, `xxl-job-core` auto-POSTs to `/api/callback`, which idempotently backfills `handleCode` (200/500) and `handleMsg`. The endpoint is registered on **every** engine (logs go to shared MySQL keyed by auto-increment logId, so no Leader funneling is needed). Note the field spelling `logDateTim` (not `logDateTime`).
+
+4. **Deterministic execution ID** — `execID = jobID:slot` sent via `executorParams`; the Java executor atomically claims it to skip duplicate dispatches across leader handover (at-least-once delivery).
+
+5. **Failover** — the new Leader loads all jobs from MySQL and remounts the wheel. A missed fire (previous trigger point already in the past) is **skipped and rescheduled from now** — deterministic, no misfire compensation.
 
 ## Quick start
 
 ### Prerequisites
 
-- Go 1.20+
-- etcd (a single node is enough)
+- Go 1.26+
+- MySQL 8+ and Redis (single instance is enough)
 
-### 1. Docker Compose (etcd + engine)
+### 1. Docker Compose (MySQL + Redis + 3 engines)
 
 ```bash
 docker-compose up -d
 ```
 
-etcd on `2379`, engine on `8080`. **Note**: the compose file only includes etcd and the engine, not a Java executor — bring up the sample executor to run an end-to-end job.
+Brings up MySQL (3306), Redis (6379), and three Go engines (8081/8082/8083). Stop any engine and the others re-elect a Leader — watch the failover logs.
+
+> Engines talk to each other via container service names (`nanojob1:8080`). To exercise the browser redirect, set `NANOJOB_ADVERTISE_ADDR` to a `localhost:<mapped-port>` address.
 
 ### 2. Run from source
 
 ```bash
-go run ./cmd/nanojob/main.go                          # etcd 127.0.0.1:2379, listen :8080
-go run ./cmd/nanojob/main.go -etcd="host:2379" -port="9090"
+# create the database first:
+#   mysql -uroot -p123456 -e "CREATE DATABASE IF NOT EXISTS nanojob DEFAULT CHARSET utf8mb4;"
+
+go run ./cmd/nanojob/main.go -c conf.json
 ```
 
-### 3. Web dashboard
+Tables are created automatically at startup.
 
-The engine does **not** serve static files. Open `ui/index.html` directly in a browser (it talks to `http://localhost:8080/api` over CORS), or serve the `ui/` directory with any static server.
-
-### 4. Kubernetes (sample manifests)
+### 3. Seed a demo job
 
 ```bash
-docker build -t nanojob/engine:v1.0 .
-kubectl apply -f deploy/k8s/nanojob-deployment.yaml
-# the same directory also has etcd-deployment.yaml / java-executor-deployment.yaml
+go run ./cmd/seed/main.go     # inserts a job that fires every 10 seconds
 ```
 
-### 5. Java executor integration
+### 4. Web dashboard
 
-The engine implements the core subset of the XXL-Job executor protocol, so xxl-job-core clients can plug in:
+Open `ui/index.html` directly in a browser (talks to `http://localhost:8080/api` over CORS). Shows each job's next-fire-time and execution logs.
+
+### 5. Java executor integration
 
 ```yaml
 xxl:
   job:
     admin:
-      addresses: http://<nanojob-engine-ip>:8080   # replace the old xxl-job-admin address
+      addresses: http://<nanojob-engine-ip>:8080
+    executor:
+      appname: loan-service
 ```
 
-See `examples/java-executor` (Spring Boot + xxl-job-core, includes the idempotency demo). The executor must report heartbeats to the engine's `/registry`.
+See `examples/java-executor` (Spring Boot + xxl-job-core, includes the `ExecutionDedup` demo). The executor must report heartbeats to `/registry`.
 
 ## Directory layout
 
 ```
-cmd/nanojob/             engine entrypoint (election, Watch, fail-fast, wheel mounting)
-core/timewheel/          single-level time wheel (tick + circle counting)
-core/store/              etcd persistence (ListJobs returns global revision)
-core/registry/           executor heartbeat registry (etcd Lease, 90s TTL)
-core/router/             sharding broadcast / single-node routing
-core/parser/             Spring 6-field cron parsing (robfig/cron)
-adapter/xxljob/          XXL-Job trigger protocol (/run)
-pkg/uid/                 Snowflake ID generator
-examples/java-executor/  sample Java executor (with ExecutionDedup demo)
-ui/                      web dashboard (open index.html directly)
+cmd/nanojob/               engine entrypoint (config, election, API wiring)
+cmd/seed/                  MySQL seed job injector
+core/timewheel/            single-level time wheel (tick + circle counting)
+core/store/                MySQL persistence (jobs + logs, auto DDL)
+core/registry/             executor heartbeat registry (Redis TTL, 90s)
+core/election/             Redis SETNX+TTL election (Lua value-check renewal)
+core/scheduler/            scheduling core (wheel, dispatch, logs, callbacks)
+core/router/               single-target routing (round-robin)
+core/parser/               Spring 6-field cron parsing (robfig/cron)
+adapter/xxljob/            XXL-Job trigger protocol (/run)
+api/                       admin API + /api/callback + /api/registry
+pkg/config/                JSON config loader (env overrides)
+examples/java-executor/    sample Java executor (with ExecutionDedup demo)
+ui/                        web dashboard (open index.html directly)
+conf.json                  default config
 ```
+
+## Differences from the old (etcd) architecture
+
+| Aspect | Old (etcd) | New (MySQL + Redis) |
+| :--- | :--- | :--- |
+| Storage | etcd: jobs + fire time | MySQL: jobs + fire time + **execution logs** |
+| Election | etcd concurrency Election | Redis SETNX + TTL custom lock (Lua value-check renewal) |
+| Incremental consumption | etcd Watch + read-then-watch | **write convergence** (307 redirect + pre-write lock check) |
+| Dedup | 3-layer dedup | removed (no more watch loop) |
+| Misfire | compensate once (>5s) | removed (skip and reschedule from now) |
+| Routing | SHARDING broadcast | removed, single-target round-robin |
+| Job ID | Snowflake + WorkerID pool | MySQL auto-increment |
+| Result feedback | fire-and-forget | **/api/callback loop + log persistence** |
+| Deploy | docker-compose(etcd) + K8s | docker-compose(MySQL+Redis+3 engines); K8s dropped |
 
 ## Known limitations
 
-- **No execution callback**: fire-and-forget dispatch; no result/status feedback, no scheduling logs (`/api/callback` not implemented).
-- **No auth** on `/api/*` or `/api/registry`.
-- **Slightly late fires are skipped**: a trigger within 0–5s late is skipped for that cycle and rescheduled; misfire compensation only covers >5s and fires once.
-- **~1s trigger granularity**: engine wheel ticks at 1s.
-- **ROUND_ROBIN is a misnomer**: it currently always picks the first alive node.
-- **Worker ID lease loss only logs a warning** (does not exit the process); ID collision is possible under extreme disconnects.
-- **Java dedup is in-process only**: multi-instance needs MySQL unique index / Redis SETNX.
-- **No job-delete API**: `DeleteJob` exists in the store layer but has no HTTP route.
-- **No cluster stress-testing**: assumes a single etcd; etcd cluster / multi-engine scaling unverified.
+- **No auth** on `/api/*`, `/api/callback`, `/api/registry`.
+- **Single-instance storage**: MySQL/Redis are single nodes; app-layer HA only.
+- **~1s trigger granularity**: the engine wheel ticks at 1s.
+- **Redirect-based write convergence**: Standby redirects rely on the client following 307; container service names aren't resolvable from a browser (see Compose note above).
+- **Java dedup is in-process only** (single JVM demo).
+- **No job-delete HTTP route** (`DeleteJob` exists in the store layer).
+- **No cluster stress-testing**; verified on single MySQL/Redis.

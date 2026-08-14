@@ -1,21 +1,65 @@
 version: '3.8'
 
 services:
-  # 1. 单节点 Etcd 服务 (用作存储和选主)
-  etcd:
-    image: bitnami/etcd:3.5
-    container_name: nanojob-etcd
+  # 1. MySQL: 任务配置 + 触发时间 + 执行日志 (暂单实例)
+  mysql:
+    image: mysql:8.0
+    container_name: nanojob-mysql
     environment:
-      - ALLOW_NONE_AUTHENTICATION=yes
-      - ETCD_ADVERTISE_CLIENT_URLS=http://nanojob-etcd:2379
+      - MYSQL_ROOT_PASSWORD=123456
+      - MYSQL_DATABASE=nanojob
     ports:
-      - "2379:2379"
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
 
-  # 2. NanoJob Go 调度引擎
-  nanojob:
-    build: .
-    container_name: nanojob-engine
-    depends_on:
-      - etcd
+  # 2. Redis: 选主锁 + 执行器注册表 (TTL 过期自动摘除)
+  redis:
+    image: redis:7-alpine
+    container_name: nanojob-redis
     ports:
-      - "8080:8080"
+      - "6379:6379"
+
+  # 3. NanoJob Go 调度引擎 × 3: 演示选举 / 时间轮 / 故障转移
+  #    每台引擎 advertise_addr 不同 (锁持有值 = Leader 地址), 数据都指向共享 MySQL/Redis
+  nanojob1:
+    build: .
+    container_name: nanojob-engine-1
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      - NANOJOB_DSN=root:123456@tcp(mysql:3306)/nanojob?charset=utf8mb4&parseTime=true
+      - NANOJOB_REDIS_ADDR=redis:6379
+      - NANOJOB_ADVERTISE_ADDR=http://nanojob1:8080
+    ports:
+      - "8081:8080"
+
+  nanojob2:
+    build: .
+    container_name: nanojob-engine-2
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      - NANOJOB_DSN=root:123456@tcp(mysql:3306)/nanojob?charset=utf8mb4&parseTime=true
+      - NANOJOB_REDIS_ADDR=redis:6379
+      - NANOJOB_ADVERTISE_ADDR=http://nanojob2:8080
+    ports:
+      - "8082:8080"
+
+  nanojob3:
+    build: .
+    container_name: nanojob-engine-3
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      - NANOJOB_DSN=root:123456@tcp(mysql:3306)/nanojob?charset=utf8mb4&parseTime=true
+      - NANOJOB_REDIS_ADDR=redis:6379
+      - NANOJOB_ADVERTISE_ADDR=http://nanojob3:8080
+    ports:
+      - "8083:8080"
+
+volumes:
+  mysql-data:

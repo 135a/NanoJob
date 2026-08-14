@@ -4,33 +4,40 @@ import (
 	"testing"
 )
 
-func TestRouterSharding(t *testing.T) {
-	// 假设 Registry 告诉我们目前有 3 台机器活着
-	aliveNodes := []string{"192.168.1.100", "192.168.1.101", "192.168.1.102"}
+func TestPickOne(t *testing.T) {
+	nodes := []string{"192.168.1.100:9999", "192.168.1.101:9999", "192.168.1.102:9999"}
 
-	// 1. 测试：分片广播策略
-	t.Log("=== 测试【分片广播 (SHARDING)】策略 ===")
-	results, err := Route(StrategySharding, aliveNodes)
+	// 1. 选中的目标必须在存活列表里
+	target, err := PickOne(nodes)
 	if err != nil {
-		t.Fatalf("路由计算失败: %v", err)
+		t.Fatalf("路由失败: %v", err)
+	}
+	t.Logf("选中目标: %s", target)
+	found := false
+	for _, n := range nodes {
+		if n == target {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("选中的目标不在存活列表里: %s", target)
 	}
 
-	for _, res := range results {
-		t.Logf("组装指令 -> IP: %s, 你负责分片: %d / %d", res.TargetIP, res.BroadcastIndex, res.BroadcastTotal)
+	// 2. 连续调用应轮流 (轮询)
+	seen := map[string]int{}
+	for i := 0; i < len(nodes)*3; i++ {
+		tgt, _ := PickOne(nodes)
+		seen[tgt]++
 	}
-	
-	if len(results) != 3 || results[2].BroadcastIndex != 2 {
-		t.Fatalf("分片计算错误")
-	}
-
-	// 2. 测试：单机轮询策略
-	t.Log("\n=== 测试【单机轮询 (ROUND_ROBIN)】策略 ===")
-	resultsSingle, err := Route(StrategyRoundRobin, aliveNodes)
-	if err != nil {
-		t.Fatalf("路由计算失败: %v", err)
+	t.Logf("轮询分布: %v", seen)
+	for n, c := range seen {
+		if c < 2 {
+			t.Fatalf("节点 %s 只被选中 %d 次, 不像轮询", n, c)
+		}
 	}
 
-	for _, res := range resultsSingle {
-		t.Logf("组装指令 -> IP: %s, 只有你干活，你是分片: %d / %d", res.TargetIP, res.BroadcastIndex, res.BroadcastTotal)
+	// 3. 空节点列表必须报错
+	if _, err := PickOne(nil); err == nil {
+		t.Fatal("空节点列表应该报错")
 	}
 }

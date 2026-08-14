@@ -1,157 +1,180 @@
 # NanoJob
 
-基于 **Go + etcd** 的分布式任务调度引擎（学习型项目），核心接口兼容 **XXL-Job** 执行器触发协议。
+基于 **Go + MySQL + Redis** 的分布式任务调度引擎（学习型项目），核心接口兼容 **XXL-Job** 执行器触发协议。
 
 <p align="center">
   <img src="https://img.shields.io/badge/Language-Go-00ADD8.svg" alt="Language">
-  <img src="https://img.shields.io/badge/Coordination-etcd-blue.svg" alt="etcd">
+  <img src="https://img.shields.io/badge/Storage-MySQL-4479A1.svg" alt="MySQL">
+  <img src="https://img.shields.io/badge/Coordination-Redis-DC382D.svg" alt="Redis">
   <img src="https://img.shields.io/badge/Compatibility-XXL--Job-important.svg" alt="XXL-Job">
 </p>
 
 ## 简介
 
-NanoJob 用 Go 从零实现了分布式任务调度的核心链路：
+NanoJob 用 Go 从零实现了分布式任务调度的核心链路，砍掉了边缘功能，保留时间轮 + XXL-JOB 适配器这两个差异化卖点：
 
 | 层 | 实现 | 说明 |
 | :--- | :--- | :--- |
-| 存储与协调 | etcd | 任务定义持久化、Leader 选举、执行器心跳注册（Lease，90s TTL 自动剔除） |
-| 调度内核 | 单层内存时间轮 + 圈数计数 | 插入 O(1)（受互斥锁保护）；引擎以 1s 滴答 × 60 槽运行 |
-| 触发协议 | XXL-Job HTTP 协议 | 兼容执行器 `/run` 触发与 `/registry` 心跳注册的核心子集 |
-| 任务 ID | Snowflake | Worker ID 由 etcd Txn 原子抢占（1~1023） |
+| 存储 | MySQL | 任务配置、触发时间、执行日志（`nanojob_job` / `nanojob_log` 两张表） |
+| 选主与注册表 | Redis | 选主用 SETNX + TTL 自研锁；执行器心跳 `SET key EX 90` 过期自动摘除 |
+| 调度内核 | 单层内存时间轮 + 圈数计数 | 1s 滴答 × 60 槽，**仅 Leader 运行** |
+| 触发协议 | XXL-Job HTTP 协议 | `/run` 触发、`/api/callback` 结果回调、`/api/registry` 心跳 |
+| 任务 ID | MySQL 自增 | 天然全局唯一，替代雪花 + WorkerID 池 |
 
-> 定位：本仓库用于学习分布式调度、etcd 协调与容错设计，非生产级产品。当前存在若干已知限制（见下文），未在大流量下做生产验证。
+> 定位：学习分布式调度、Redis 选主、写收敛与容错设计。存储层（MySQL/Redis）暂为单实例，应用层多副本 HA。
 
-## 核心机制（三个已修复的分布式问题）
+## 架构
 
-### 1. Watch 统一消费 —— 修复"孤儿任务"
-
-**问题**：旧实现里任务"写到哪台引擎就在哪台热加载调度"。请求打到 Standby（从未当选 Leader、时间轮未启动）时，任务入库后无人调度，变成孤儿。
-
-**方案**：调度权收拢到 Leader。任意引擎（含 Standby）都只负责把任务写进 etcd；Leader 通过 etcd Watch 统一消费增量。为封死 "ListJobs 与 Watch 之间新写入被漏掉" 的竞态窗口，采用 read-then-watch：
-
-1. `ListJobs(ctx)` 捞出存量任务，同时拿到 etcd 全局 `revision`；
-2. `WatchJobs(rev+1)` 从该 revision 的下一笔增量开始监听；
-3. Watch 事件到达后 `scheduleJob` 挂载进时间轮，并按 `(jobID, 触发点)` 去重，防住"Leader 写回 NextTriggerTime 被自己 Watch 到 → 自旋重复挂载"。
-
-### 2. fail-fast 夺权 —— 修复"脑裂"
-
-**问题**：旧代码当选后 `select {}` 空转，永不检查租约。旧 Leader 与 etcd 失联后仍僵尸化派发，与接管的新 Leader 同时下发 = 脑裂（重复触发）。
-
-**方案**：监听两个互补信号，确认失去领导权立即停止调度：
-
-- `session.Done()`：本地信号（etcd 连接断开 / 租约被撤销），etcd 不可达时依然有效；
-- `election.Observe()`：远端信号（leader key 被删 / 被新 Leader 顶替）。
-
-任一信号触发 → `tw.Stop()` 停时间轮 + `watcherCancel()` 停 Watch + return，`defer session.Close()` 撤销租约，让 Standby 干净接管。
-
-⚠️ 实现细节：Observe 可能先推一条"当前主还是我自己"，此时绝不能退出（否则"当选即让位"活锁），需用 for 循环只在"key 被删 / 值不是本节点"时退出；断连时库内部 Get 失败会 close channel，从已关闭 channel 收到的是 nil，必须判空，否则 `resp.Kvs` 空指针 panic。
-
-### 3. 确定性执行 ID + 执行器幂等 —— 修复"交接期重复"
-
-**问题**：本系统对外契约是 at-least-once（至少一次）投递。旧 Leader 合法在位时派发过 slot N，随后失联；新 Leader 接管时无法确认"旧主派没派"，把它当漏发再补一次 → 同一触发被派发两次。这是分布式系统的结构性问题，调度层无法根除。
-
-**方案**：调度端为每次触发生成**确定性执行 ID** = `任务ID:触发时间戳`（如 `1834567890123456789:1723456789`），通过 `executorParams` 透传给执行器；执行端（Java demo）按执行 ID 做**原子占位**去重：
-
-- Go 端 `fireOnce`：`execID = jobID + ":" + slot`，`json.Marshal({"executionId": execID})` 写入 `RunReq.ExecutorParams`；
-- Java 端 `ExecutionDedup.tryClaim()`：`XxlJobHelper.getJobParam()` 解析出 executionId，用 `ConcurrentHashMap.putIfAbsent` 原子占位，占位失败即重复派发，直接跳过。
-
-关键点：
-
-- execID 必须**确定性派生**（不能用随机 UUID），否则两次派发 ID 不同、执行器认不出重复；
-- 执行 ID 的 `slot` 必须在派发前**同步快照**（misfire 补偿时尤其如此），异步派发内读 `job.NextTriggerTime` 会读到已被改写的下一周期值；
-- demo 用进程内内存表去重，只覆盖单 JVM；多实例部署需换成共享存储（MySQL 唯一索引 / Redis SETNX）。
-
-## 性能数据（本机实测）
-
-以下数字来自 `core/timewheel` 微基准测试（**1ms 滴答**）：
-
-| 指标 | 实测 | 场景 |
-| :--- | :--- | :--- |
-| 并发插入 | 约 115 ns/op（约 870 万次/秒，2 allocs/op） | 1ms 滴答 × 3600 槽 |
-| 调度精度 | 平均偏差 4.1ms / P95 7.4ms / 最大 7.8ms | 2000 任务，2~4s 均匀延迟 |
-| 内存占用 | 100 万任务 +53.5MB（单任务 56B） | 1ms 滴答 × 3600 槽 |
-| 触发吞吐 | 5 万任务 3.5s 全部触发，零丢失 | 0.5~3.5s 均匀延迟 |
-| 语句覆盖率 | 100% | 全套 Go 测试通过 |
-
-⚠️ **重要**：毫秒级精度、纳秒级插入均来自 **1ms 滴答的微基准**；**引擎运行配置为 1s 滴答 × 60 槽，实际触发粒度约 1 秒**。不要把这些数字当成生产环境精度。
-
-复现命令：
-
-```bash
-go test ./core/timewheel/ -run 'TestSchedulingPrecision|TestTriggerThroughput|TestMemoryFootprint' -v
-go test ./core/timewheel/ -bench BenchmarkTimeWheelAdd -benchtime=1s -run '^$'
 ```
+            前端 UI (ui/index.html, 任意节点地址)
+                    │ 写请求
+                    ▼
+        ┌───────────────────────────────┐
+        │  Go 引擎集群 (应用层多副本)      │
+        │  Leader: 时间轮调度 + 写路径    │
+        │  Standby: 只收 HTTP, 写请求     │
+        │          307 重定向到 Leader    │
+        └──────┬───────────────┬─────────┘
+               │               │
+       ┌───────▼─────┐   ┌─────▼──────────┐
+       │ MySQL       │   │ Redis          │
+       │ 任务+触发+日志│   │ 选主锁 + 注册表 │
+       └─────────────┘   └────────────────┘
+               ▲
+               │ /run 触发 + executionId 幂等
+               │ 跑完 POST /api/callback 回填结果
+        ┌──────┴──────────┐
+        │ Java 执行器集群   │
+        │ (xxl-job-core)  │
+        └─────────────────┘
+```
+
+### 核心机制
+
+**1. Redis 选主（SETNX + TTL 自研锁，5s 租约）**
+
+`SET nanojob:election:<cluster> <nodeID> NX EX 5` 一步原子抢锁；Leader 每 tick（ttl/3）用 Lua 脚本**按值校验**后刷新 TTL —— 只有 key 当前值仍是自己才续期，杜绝"旧主失联后与新主同时续期一把锁 = 双主脑裂"（汲取 easytask `distribmu` 的 LockWait 超时误判教训）。锁持有值就是 Leader 的对外地址，同时充当 Standby 的重定向目标。
+
+**2. 写收敛 Leader（砍掉 etcd Watch 与三层去重）**
+
+写请求打到任何节点都行：Leader 直接落库并挂时间轮；Standby 收到写 → **307 重定向**到当前 Leader（`fetch` 自动跟随，Body 原样带过去）。Leader 真正写入前再调 `VerifyLeadership()` 问一次 Redis，防"检查通过到写入之间锁被抢走"。调度权与"谁收到请求"再次解耦，但这次靠的是写收敛而不是 Watch 回环，所以 `inWheel/lastFired/skipDedup` 三层去重可以整体删除。
+
+**3. 回调闭环（`/api/callback` + `nanojob_log`）**
+
+```
+触发前先插一行"运行中"日志拿 logId
+   → RunReq 带 LogID / LogDateTime 发给 Java
+   → Java 跑完 xxl-job-core 自动 POST /api/callback
+   → 按 logId 幂等回填 handleCode(200成功/500失败) + handleMsg(日志内容)
+```
+
+回调端点**所有节点**都注册、不必收敛 Leader —— 日志追加到共享 MySQL、按自增 logId 定位。执行器配 `xxl.job.admin.addresses` 指向任意一台 Go 引擎即可，标准 xxl-job-core 无需改动。字段名是 `logDateTim`（不是 logDateTime），解析时别按错。
+
+**4. 确定性执行 ID + 执行器幂等（at-least-once 兜底）**
+
+每次触发生成 `execID = jobID:slot`，经 `executorParams` 透传给 Java；执行器按此 ID 原子占位去重，新旧 Leader 交接期重复派发直接跳过。`execID` 必须确定性派生（不能用随机 UUID），`slot` 必须在异步派发前快照。
+
+**5. 故障转移**
+
+新 Leader 当选后从 MySQL 全量加载任务挂进时间轮。错过的一次触发（原触发点已在过去）**直接跳过、从当前时刻重排**，行为可预期，不再补偿。
 
 ## 快速启动
 
 ### 准备
 
-- Go 1.20+
-- etcd（单节点即可）
+- Go 1.26+
+- MySQL 8+ 与 Redis（单实例即可）
 
-### 1. Docker Compose（etcd + 引擎）
+### 1. Docker Compose（MySQL + Redis + 3 引擎）
 
 ```bash
 docker-compose up -d
 ```
 
-启动后 etcd 在 `2379`、引擎在 `8080`。**注意**：Compose 只包含 etcd 和调度引擎，不含 Java 执行器；要端到端触发一个任务，还需自行启动示例执行器。
+一条命令拉起：MySQL（3306）、Redis（6379）、三个 Go 引擎（8081/8082/8083）。停止中间某一台引擎，另两台会自动重新选主接管——可直接观察故障转移日志。
+
+**注意**：引擎之间用容器服务名互通（如 `nanojob1:8080`）。浏览器访问 `localhost:8081~8083` 时，若写请求落在 Standby，重定向 Location 是容器内地址、浏览器解析不了 —— 想从浏览器验证"重定向"效果，把对应引擎的 `NANOJOB_ADVERTISE_ADDR` 改成 `http://localhost:<映射端口>` 即可。
 
 ### 2. 源码启动
 
 ```bash
-go run ./cmd/nanojob/main.go                          # 默认连接 127.0.0.1:2379，监听 :8080
-go run ./cmd/nanojob/main.go -etcd="host:2379" -port="9090"
+# 先建库 (引擎不会自动建库):
+#   mysql -uroot -p123456 -e "CREATE DATABASE IF NOT EXISTS nanojob DEFAULT CHARSET utf8mb4;"
+
+# 单引擎
+go run ./cmd/nanojob/main.go -c conf.json
+
+# 三引擎本地演示: 各自改 conf.json 的 port + advertise_addr (或设环境变量)
+NANOJOB_ADVERTISE_ADDR=http://127.0.0.1:9090 go run ./cmd/nanojob/main.go -c conf.json
 ```
 
-### 3. 可视化大盘
+引擎启动时自动建表（`nanojob_job` / `nanojob_log`）。
 
-引擎**不托管静态页面**。直接双击打开 `ui/index.html`（它通过 `http://localhost:8080/api` + CORS 读取/新增任务），或用任意静态服务器托管 `ui/` 目录。
-
-### 4. K8s 部署（示例清单）
+### 3. 注入种子任务
 
 ```bash
-docker build -t nanojob/engine:v1.0 .
-kubectl apply -f deploy/k8s/nanojob-deployment.yaml
-# 同一目录还有 etcd-deployment.yaml / java-executor-deployment.yaml 示例
+go run ./cmd/seed/main.go          # 向 MySQL 插入一条每 10 秒触发的演示任务
 ```
+
+### 4. 可视化大盘
+
+引擎不托管静态页面。双击打开 `ui/index.html`（通过 `http://localhost:8080/api` + CORS 读写），可新增任务、查看每行任务的**下次触发时间**与**执行日志**。
 
 ### 5. Java 执行器接入
 
-实现的是 XXL-Job 执行器协议核心子集，因此基于 xxl-job-core 的客户端可以接入：
+实现的是 XXL-Job 执行器协议核心子集，基于 xxl-job-core 的客户端可以直接接入：
 
 ```yaml
 xxl:
   job:
     admin:
-      addresses: http://<nanojob-engine-ip>:8080   # 替换原 xxl-job-admin 地址
+      addresses: http://<nanojob-engine-ip>:8080   # 回调 + 心跳都打这里
+    executor:
+      appname: loan-service
 ```
 
-示例执行器在 `examples/java-executor`（Spring Boot + xxl-job-core，含幂等去重 demo），执行器需向引擎 `/registry` 上报心跳。
+示例执行器在 `examples/java-executor`（Spring Boot + xxl-job-core，含 ExecutionDedup 幂等 demo），需向引擎 `/registry` 上报心跳。
 
 ## 目录结构
 
 ```
-cmd/nanojob/             引擎入口（选主、Watch、fail-fast、时间轮挂载）
-core/timewheel/          单层时间轮（tick + 圈数计数）
-core/store/              etcd 持久化（ListJobs 返回全局 revision）
-core/registry/           执行器心跳注册（etcd Lease，90s TTL）
-core/router/             分片广播 / 单机路由
-core/parser/             Spring 6 位 Cron 解析（robfig/cron）
-adapter/xxljob/          XXL-Job 触发协议封装（/run）
-pkg/uid/                 Snowflake 发号器
-examples/java-executor/  示例 Java 执行器（含 ExecutionDedup 幂等 demo）
-ui/                      可视化大盘（直接打开 index.html 使用）
+cmd/nanojob/              引擎入口 (config 加载、Redis 选主、API 装配)
+cmd/seed/                 MySQL 种子任务注入
+core/timewheel/           单层时间轮 (tick + 圈数计数)
+core/store/               MySQL 持久化 (任务 + 日志, 自动建表)
+core/registry/            执行器心跳注册 (Redis TTL, 90s 自动摘除)
+core/election/            Redis SETNX+TTL 自研选主 (Lua 值校验续期)
+core/scheduler/           调度核心 (挂轮子、派发、落日志、回调驱动)
+core/router/              单目标路由 (轮询)
+core/parser/              Spring 6 位 Cron 解析 (robfig/cron)
+adapter/xxljob/           XXL-Job 触发协议封装 (/run)
+api/                      管理 API + /api/callback + /api/registry
+pkg/config/               JSON 配置加载 (支持环境变量覆盖)
+examples/java-executor/   示例 Java 执行器 (含 ExecutionDedup 幂等 demo)
+ui/                       可视化大盘 (直接打开 index.html 使用)
+conf.json                 默认配置
 ```
 
-## 已知限制（未实现）
+## 与旧版（etcd）架构的差异
 
-- **触发无回调**：fire-and-forget，派发后不感知执行结果，无调度日志（`/api/callback` 未实现）。
-- **接口无鉴权**：`/api/*` 与 `/api/registry` 未做认证。
-- **轻微迟到会被跳过**：0~5s 内的迟到触发当次直接跳过、排到下周期；misfire 只补偿 >5s 的漏发，且每次只补一次。
+| 维度 | 旧版 (etcd) | 新版 (MySQL + Redis) |
+| :--- | :--- | :--- |
+| 存储 | etcd：任务 + 触发时间 | MySQL：任务 + 触发时间 + **执行日志** |
+| 选主 | etcd concurrency Election | Redis SETNX + TTL 自研锁（Lua 值校验续期） |
+| 增量消费 | Watch 统一消费 + read-then-watch | **写收敛 Leader**（Standby 307 重定向 + 写前校验锁） |
+| 去重 | 三层去重（inWheel/lastFired/skipDedup） | 删掉（撤 Watch 后回环消失） |
+| 补偿 | misfire 补偿（>5s 补一次） | 砍掉（错过即跳过，从当前重排） |
+| 路由 | 分片广播 SHARDING | 砍掉，单目标轮询 |
+| 任务 ID | 雪花 + WorkerID 池（etcd 租约） | MySQL 自增 |
+| 执行结果 | fire-and-forget，无感知 | **/api/callback 闭环 + 日志落库** |
+| 部署 | docker-compose(etcd) + K8s 清单 | docker-compose(MySQL+Redis+3 引擎)，K8s 砍掉 |
+
+## 已知限制
+
+- **接口无鉴权**：`/api/*`、`/api/callback`、`/api/registry` 未做认证。
+- **存储层单点**：MySQL / Redis 暂单实例；应用层多副本 HA，存储层故障无自动恢复。
 - **触发粒度约 1s**：引擎时间轮 1s 滴答。
-- **ROUND_ROBIN 名不副实**：当前实现固定取第一个存活节点。
-- **Worker ID 租约丢失仅告警**：不退出进程，极端断连下存在 ID 冲突风险（代码注释已标注）。
-- **Java 去重仅进程内**：多实例需换成 MySQL 唯一索引 / Redis SETNX 等共享存储。
+- **写收敛靠重定向**：Standby 收到写请求依赖浏览器/客户端跟随 307；容器内服务名对浏览器不可达（见上文 Compose 注意）。
+- **Java 去重仅进程内**：demo 用内存表去重，多实例需换共享存储（MySQL 唯一索引 / Redis SETNX）。
 - **无任务删除接口**：store 层有 `DeleteJob`，但未暴露 HTTP 路由。
-- **未做集群压测**：假设单 etcd；etcd 集群、多引擎横向扩展均未验证。
+- **未做集群压测**：单 MySQL / 单 Redis 假设下验证过选举与调度，大规模横向扩展未压测。

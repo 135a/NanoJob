@@ -8,22 +8,27 @@ import (
 	"strings"
 	"time"
 
-	clientv3 "go.etcd.io/etcd/client/v3"
+	"github.com/redis/go-redis/v9"
 )
 
-var etcdClient *clientv3.Client
+var redisClient *redis.Client
 
-// Init 注入 etcd 客户端
-func Init(client *clientv3.Client) {
-	etcdClient = client
+// Init 注入 Redis 客户端
+func Init(client *redis.Client) {
+	redisClient = client
 }
 
 // RegistryParam XXL-Job 客户端心跳上报的 JSON 请求格式
 type RegistryParam struct {
 	RegistryGroup string `json:"registryGroup"` // 通常是 "EXECUTOR"
-	RegistryKey   string `json:"registryKey"`   // 应用名，比如 "loan-service"
+	RegistryKey   string `json:"registryKey"`   // 应用名, 比如 "loan-service"
 	RegistryValue string `json:"registryValue"` // 节点的 IP:Port (如 192.168.1.100:9999)
 }
+
+const (
+	registryPrefix = "nanojob:registry:"
+	heartbeatTTL   = 90 * time.Second
+)
 
 // ReceiveHeartbeat 提供给 Java 端调用的 HTTP 接口处理函数
 func ReceiveHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -32,32 +37,19 @@ func ReceiveHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "解析心跳报文失败", http.StatusBadRequest)
 		return
 	}
-
-	if etcdClient == nil {
-		http.Error(w, "etcd 尚未初始化", http.StatusInternalServerError)
+	if redisClient == nil {
+		http.Error(w, "Redis 尚未初始化", http.StatusInternalServerError)
 		return
 	}
 
-	// 核心改造：将心跳写入 etcd，并绑定 90 秒租约
+	// SET key 1 EX 90: 幂等刷新 TTL。节点宕机 90s 不再续期, Redis 自动过期摘除 (替代 etcd Lease)。
+	// 相比"健康检查器主动探活", 省掉了额外的定时探活组件。
+	key := fmt.Sprintf("%s%s:%s", registryPrefix, param.RegistryKey, param.RegistryValue)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-
-	// 1. 申请一个 90 秒的租约 (如果机器挂了，90秒后 etcd 会自动删掉它的记录)
-	lease, err := etcdClient.Grant(ctx, 90)
-	if err != nil {
-		fmt.Printf("心跳租约申请失败: %v\n", err)
-		http.Error(w, "底层 etcd 错误", http.StatusInternalServerError)
-		return
-	}
-
-	// 2. 写入键值对，Key 格式为: /nanojob/registry/{appName}/{ip}
-	key := fmt.Sprintf("/nanojob/registry/%s/%s", param.RegistryKey, param.RegistryValue)
-	
-	// 3. 把 Key 和 租约 绑定起来
-	_, err = etcdClient.Put(ctx, key, "", clientv3.WithLease(lease.ID))
-	if err != nil {
-		fmt.Printf("心跳写入 etcd 失败: %v\n", err)
-		http.Error(w, "底层 etcd 错误", http.StatusInternalServerError)
+	if err := redisClient.Set(ctx, key, "1", heartbeatTTL).Err(); err != nil {
+		fmt.Printf("心跳写入 Redis 失败: %v\n", err)
+		http.Error(w, "底层 Redis 错误", http.StatusInternalServerError)
 		return
 	}
 
@@ -66,33 +58,33 @@ func ReceiveHeartbeat(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"code": 200, "msg": null}`))
 }
 
-// GetAliveNodes （供我们的 Router 调用）获取某个应用下当前活着的所有节点 IP
+// GetAliveNodes (供 Router 调用) 获取某个应用下当前活着的所有节点 IP
 func GetAliveNodes(appname string) []string {
-	if etcdClient == nil {
+	if redisClient == nil {
 		return nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// 查询前缀为 /nanojob/registry/{appName}/ 的所有存活节点
-	prefix := fmt.Sprintf("/nanojob/registry/%s/", appname)
-	resp, err := etcdClient.Get(ctx, prefix, clientv3.WithPrefix())
+	// KEYS 按前缀扫出存活节点。单实例 Redis + 小规模节点足够;
+	// 若日后上 Redis Cluster / 大集群, 应换成 SCAN 分批迭代, 避免阻塞。
+	pattern := fmt.Sprintf("%s%s:*", registryPrefix, appname)
+	keys, err := redisClient.Keys(ctx, pattern).Result()
 	if err != nil {
-		fmt.Printf("查询 etcd 注册表失败: %v\n", err)
+		fmt.Printf("查询 Redis 注册表失败: %v\n", err)
 		return nil
 	}
 
-	var aliveNodes []string
-	for _, kv := range resp.Kvs {
-		keyStr := string(kv.Key)
-		// 严谨改造：XXL-Job 上报的可能是 "http://10.244.0.4:9999/"，里面自带斜杠
-		// 所以绝对不能用 strings.Split，必须用 TrimPrefix 原汁原味地截取出来！
-		ip := strings.TrimPrefix(keyStr, prefix)
+	// XXL-Job 上报的 RegistryValue 可能是 "http://10.244.0.4:9999/" (自带斜杠),
+	// 这里用 TrimPrefix 原汁原味截取, 绝不能用 Split 去切。
+	prefix := fmt.Sprintf("%s%s:", registryPrefix, appname)
+	aliveNodes := make([]string, 0, len(keys))
+	for _, key := range keys {
+		ip := strings.TrimPrefix(key, prefix)
 		if ip != "" {
 			aliveNodes = append(aliveNodes, ip)
 		}
 	}
-
 	return aliveNodes
 }
