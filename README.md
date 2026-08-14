@@ -68,7 +68,7 @@ mindmap
         按 logId 幂等回填
       确定性执行 ID
         jobID 与 slot
-        Java 侧原子去重
+        执行日志关联
       故障转移
         新 Leader 重载
         错过即重排
@@ -126,9 +126,9 @@ mindmap
 
 回调端点**所有节点**都注册、不必收敛 Leader —— 日志追加到共享 MySQL、按自增 logId 定位。执行器配 `xxl.job.admin.addresses` 指向任意一台 Go 引擎即可，标准 xxl-job-core 无需改动。字段名是 `logDateTim`（不是 logDateTime），解析时别按错。
 
-**4. 确定性执行 ID + 执行器幂等（at-least-once 兜底）**
+**4. 确定性执行 ID（执行日志关联）**
 
-每次触发生成 `execID = jobID:slot`，经 `executorParams` 透传给 Java；执行器按此 ID 原子占位去重，新旧 Leader 交接期重复派发直接跳过。`execID` 必须确定性派生（不能用随机 UUID），`slot` 必须在异步派发前快照。
+每次触发生成 `execID = jobID:slot` 写入 `nanojob_log.exec_id`，把某次触发与该次的回调结果在日志上对上号。`slot` 必须在异步派发前快照（不能在派发时再读已被重排改写的时间点）。新架构"错过即重排、不补发"，同一触发点最多派发一次，执行器端不需要再去重。
 
 **5. 故障转移**
 
@@ -182,7 +182,9 @@ go run ./cmd/seed/main.go    # 向 MySQL 插入一条每 10 秒触发的演示�
 
 ### 可视化大盘
 
-引擎不托管静态页面。双击打开 `ui/index.html`（通过 `http://localhost:8080/api` + CORS 读写），可新增任务、查看每行任务的**下次触发时间**与**执行日志**。
+引擎不托管静态页面。双击打开 `ui/index.html`（通过 API + CORS 读写），可新增任务、查看每行任务的**下次触发时间**与**执行日志**。
+
+前端在 `ui/index.html` 顶部 `API_ENGINES` 数组里配置**全部引擎地址**，请求按顺序尝试：当前引擎挂了自动切下一台（**失败重试，非随机**），写请求落在 Standby 时引擎 307 重定向到 Leader、`fetch` 自动跟随。头部状态栏会实时显示当前连的是哪台引擎——杀掉一台引擎再刷新页面，就能看到故障转移。
 
 ### 验证核心链路（curl）
 
@@ -220,7 +222,7 @@ xxl:
       appname: loan-service
 ```
 
-示例执行器在 `examples/java-executor`（Spring Boot + xxl-job-core，含 ExecutionDedup 幂等 demo），需向引擎 `/registry` 上报心跳。
+示例执行器在 `examples/java-executor`（Spring Boot + xxl-job-core），需向引擎 `/registry` 上报心跳。
 
 ### 常见问题
 
@@ -248,7 +250,7 @@ core/parser/              Spring 6 位 Cron 解析 (robfig/cron)
 adapter/xxljob/           XXL-Job 触发协议封装 (/run)
 api/                      管理 API + /api/callback + /api/registry
 pkg/config/               JSON 配置加载 (支持环境变量覆盖)
-examples/java-executor/   示例 Java 执行器 (含 ExecutionDedup 幂等 demo)
+examples/java-executor/   示例 Java 执行器 (标准 xxl-job-core 接入 demo)
 ui/                       可视化大盘 (直接打开 index.html 使用)
 conf.json                 默认配置
 ```
@@ -273,6 +275,5 @@ conf.json                 默认配置
 - **存储层单点**：MySQL / Redis 暂单实例；应用层多副本 HA，存储层故障无自动恢复。
 - **触发粒度约 1s**：引擎时间轮 1s 滴答。
 - **写收敛靠重定向**：Standby 收到写请求依赖浏览器/客户端跟随 307；容器内服务名对浏览器不可达（见上文 Compose 注意）。
-- **Java 去重仅进程内**：demo 用内存表去重，多实例需换共享存储（MySQL 唯一索引 / Redis SETNX）。
 - **无任务删除接口**：store 层有 `DeleteJob`，但未暴露 HTTP 路由。
 - **未做集群压测**：单 MySQL / 单 Redis 假设下验证过选举与调度，大规模横向扩展未压测。

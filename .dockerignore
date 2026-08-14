@@ -1,0 +1,6 @@
+# 构建上下文瘦身: 这些文件不参与镜像构建, 否则每次 build 都要全量上传 (尤其 .git)
+.git
+*.md
+data/
+logs/
+examples/java-executor/target/

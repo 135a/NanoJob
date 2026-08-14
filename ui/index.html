@@ -260,7 +260,7 @@
     <header>
         <div class="logo">NanoJob Admin</div>
         <div style="color: var(--text-muted); font-size: 0.9rem;">
-            <span class="status-dot"></span>引擎运行中 (Port: 8080)
+            <span class="status-dot"></span><span id="engineStatus">正在连接调度引擎...</span>
         </div>
     </header>
 
@@ -335,7 +335,45 @@
     </div>
 
     <script>
-        const API_BASE = 'http://localhost:8080/api';
+        // ============ 多引擎高可用接入 (方案A: 失败自动切下一台) ============
+        // 前端配置全部引擎地址, 依次尝试; 当前引擎挂了自动切下一台 —— 有序重试, 不是随机。
+        // 写请求 (POST) 落在 Standby 时, 引擎会 307 重定向到 Leader, fetch 默认自动跟随。
+        // 本地三引擎演示: 9090/9091/9092; docker 三引擎: localhost:8081/8082/8083。
+        const API_ENGINES = [
+            'http://localhost:8080',
+            'http://localhost:8081',
+            'http://localhost:8082',
+        ];
+
+        function setEngineStatus(text) {
+            const el = document.getElementById('engineStatus');
+            if (el) el.textContent = text;
+        }
+
+        // 统一 API 调用: 失败重试下一台引擎。
+        // fetch 只在"网络层失败"(连接拒绝/超时)时抛异常 —— 这正是引擎挂掉的特征;
+        // HTTP 错误状态码 (4xx/5xx) 不会抛, 照常返回给调用方判断。
+        // 单台 5s 超时 (AbortController), 防止一台"假死"的引擎把整个循环卡死。
+        async function api(path, options = {}) {
+            let lastErr = null;
+            for (const base of API_ENGINES) {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), 5000);
+                try {
+                    const resp = await fetch(`${base}/api/${path}`, { ...options, signal: ctrl.signal });
+                    // resp.url 是重定向后的最终地址 (307 收敛到 Leader 时能看到真实引擎)
+                    setEngineStatus('当前引擎: ' + new URL(resp.url).origin);
+                    return resp;
+                } catch (e) {
+                    lastErr = e;
+                    console.warn(`[NanoJob] 引擎 ${base} 不可达或超时, 尝试下一台...`, e);
+                } finally {
+                    clearTimeout(timer);
+                }
+            }
+            setEngineStatus('❌ 所有配置的引擎均不可达');
+            throw lastErr || new Error('所有引擎都不可达');
+        }
 
         // 页面加载完毕即刻拉取数据
         document.addEventListener('DOMContentLoaded', fetchJobs);
@@ -352,7 +390,7 @@
         // 调用 Go 引擎获取任务列表
         async function fetchJobs() {
             try {
-                const response = await fetch(`${API_BASE}/job/list`);
+                const response = await api('job/list');
                 const res = await response.json();
                 
                 const tbody = document.getElementById('jobTableBody');
@@ -382,7 +420,7 @@
             } catch (error) {
                 console.error("请求失败", error);
                 document.getElementById('jobTableBody').innerHTML =
-                    '<tr><td colspan="7" style="text-align:center;color:var(--danger)">无法连接到 Go 调度引擎，请确保引擎已在 8080 端口启动。</td></tr>';
+                    '<tr><td colspan="7" style="text-align:center;color:var(--danger)">无法连接所有 Go 调度引擎，请检查页面顶部 API_ENGINES 里配置的地址。</td></tr>';
             }
         }
 
@@ -392,7 +430,7 @@
             document.getElementById('logModalTitle').textContent = `执行日志 - 任务 #${jobId}`;
             document.getElementById('logContent').innerHTML = '加载中...';
             try {
-                const resp = await fetch(`${API_BASE}/job/logs?id=${jobId}`);
+                const resp = await api('job/logs?id=' + jobId);
                 const res = await resp.json();
                 const box = document.getElementById('logContent');
                 if (res.code !== 200 || !res.data || res.data.length === 0) {
@@ -435,7 +473,7 @@
             btn.disabled = true;
 
             try {
-                const response = await fetch(`${API_BASE}/job/add`, {
+                const response = await api('job/add', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(payload)
@@ -450,7 +488,7 @@
                     alert("报错了: " + res.msg);
                 }
             } catch (error) {
-                alert("网络请求失败，检查 Go 引擎是否运行");
+                alert("网络请求失败，所有配置的 Go 引擎均不可达");
             } finally {
                 btn.textContent = '保存并热加载';
                 btn.disabled = false;

@@ -11,6 +11,9 @@ CREATE TABLE IF NOT EXISTS nanojob_job (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- 执行日志表: 每次触发的派发信息 + Java 回调回填的执行结果
+-- 索引: 日志查询唯一入口是 ListLogs (WHERE job_id=? ORDER BY id DESC),
+--       日志表随触发次数无限增长, 必须走 job_id 索引。二级索引隐含主键 id,
+--       复合索引 (job_id, id) 同时覆盖过滤 + 倒序排序, 免 filesort。
 CREATE TABLE IF NOT EXISTS nanojob_log (
     id               BIGINT AUTO_INCREMENT PRIMARY KEY,
     job_id           BIGINT       NOT NULL,
@@ -21,5 +24,6 @@ CREATE TABLE IF NOT EXISTS nanojob_log (
     trigger_ip       VARCHAR(128) NOT NULL DEFAULT '',
     handle_code      INT          NOT NULL DEFAULT 0,
     handle_msg       TEXT,
-    callback_time    BIGINT       NOT NULL DEFAULT 0
+    callback_time    BIGINT       NOT NULL DEFAULT 0,
+    KEY idx_log_job_id (job_id, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -163,7 +163,9 @@ go run ./cmd/seed/main.go     # inserts a job that fires every 10 seconds
 
 ### Web dashboard
 
-Open `ui/index.html` directly in a browser (talks to `http://localhost:8080/api` over CORS). Shows each job's next-fire-time and execution logs.
+Open `ui/index.html` directly in a browser (talks to the engines over CORS). Shows each job's next-fire-time and execution logs.
+
+The frontend lists **all engine addresses** in the `API_ENGINES` array at the top of `ui/index.html` and tries them in order: if the current engine dies it fails over to the next one automatically (ordered retry, not random). Writes landing on a Standby are 307-redirected to the Leader and `fetch` follows. The header status bar shows which engine is currently connected — kill an engine and refresh to watch the failover.
 
 ### Verify the core loop (curl)
 

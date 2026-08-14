@@ -104,10 +104,20 @@ func dsnWithoutDatabase(dsn string) string {
 }
 
 // splitStatements 按分号切分 SQL 文件为单条语句, 忽略空串。
-// 本项目 DDL 无内嵌分号, 简单切分足够; 含 -- 注释行也能整体执行 (MySQL 忽略注释)。
+// 先剔除整行 -- 注释再切分: 注释里可能混入分号 (如中文标点), 直接切分会把注释文本
+// 当成一条 SQL 执行, 曾因此报 Error 1064。整行注释删掉不影响语句本身。
 func splitStatements(ddl string) []string {
+	lines := strings.Split(ddl, "\n")
+	keep := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "--") {
+			continue
+		}
+		keep = append(keep, line)
+	}
+
 	var stmts []string
-	for _, s := range strings.Split(ddl, ";") {
+	for _, s := range strings.Split(strings.Join(keep, "\n"), ";") {
 		if s = strings.TrimSpace(s); s != "" {
 			stmts = append(stmts, s)
 		}

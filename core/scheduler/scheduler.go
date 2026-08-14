@@ -58,7 +58,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 }
 
 // Stop 让位: 停时间轮。已排队但未到点的任务丢弃, 由新 Leader 重新加载。
-// 已在派发途中的 fireOnce 不受影响 (at-least-once 边界)。
+// 已在派发途中的 fireOnce 异步 goroutine 会跑完, 回调仍会按 logId 回填日志。
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -155,7 +155,8 @@ func (s *Scheduler) reschedule(job *store.JobInfo) {
 func (s *Scheduler) fireOnce(job *store.JobInfo, slot int64) {
 	fmt.Printf("\n[%s] ⚡ 任务 %d 触发, 开始派发\n", time.Now().Format("15:04:05"), job.ID)
 
-	// 确定性执行 ID = jobID:slot, Java 端按此原子去重 (at-least-once 投递的兜底伞)
+	// 执行 ID = jobID:slot, 落 nanojob_log.exec_id 供日志关联。
+	// 错过即重排、不补发 → 同一 slot 最多派发一次, 执行器端无需再去重。
 	execID := fmt.Sprintf("%d:%d", job.ID, slot)
 	execParam, _ := json.Marshal(map[string]string{"executionId": execID})
 
