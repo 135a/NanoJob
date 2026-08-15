@@ -71,7 +71,7 @@ func main() {
 
 	// 5. 后台选举循环 + 领导权变化驱动 上位(start) / 让位(stop)
 	go func() {
-		errCh := make(chan error, 4)
+		errCh := make(chan error, 2)
 		go elect.LoopInElect(context.Background(), errCh)
 		go func() {
 			for e := range errCh {
