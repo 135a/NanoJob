@@ -34,7 +34,7 @@ type APIResponse struct {
 func (api *JobAPI) respondJSON(w http.ResponseWriter, code int, msg string, data interface{}) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, DELETE")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Auth-Token")
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(APIResponse{Code: code, Msg: msg, Data: data})
 }
@@ -128,7 +128,7 @@ func (api *JobAPI) Logs(w http.ResponseWriter, r *http.Request) {
 
 // RegisterRoutes 注册全部路由
 func (api *JobAPI) RegisterRoutes() {
-	http.HandleFunc("/api/job/list", api.ListJobs)
-	http.HandleFunc("/api/job/add", api.AddJob)
-	http.HandleFunc("/api/job/logs", api.Logs)
+	http.HandleFunc("/api/job/list", AuthMiddleware(api.ListJobs))
+	http.HandleFunc("/api/job/add", AuthMiddleware(api.AddJob))
+	http.HandleFunc("/api/job/logs", AuthMiddleware(api.Logs))
 }
