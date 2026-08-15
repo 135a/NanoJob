@@ -26,57 +26,62 @@ NanoJob 用 Go 从零实现了分布式任务调度的核心链路，砍掉了�
 ## 项目思维导图
 
 ```mermaid
-mindmap
-  root((NanoJob 分布式调度引擎))
-    定位
-      分布式任务调度
-      XXL-Job 协议兼容
-      学习型项目
-    技术栈
-      Go 1.26+
-      MySQL 存储
-      Redis 协调
-      xxl-job-core 执行器
-    架构分层
-      存储层
-        MySQL 任务 触发 日志
-        Redis 选主锁 注册表
-      调度内核
-        时间轮 1s 滴答 60 槽
-        Cron 解析器
-        单目标路由
-      选举与注册
-        SETNX + TTL 选主
-        心跳 TTL 注册表
-      协议层
-        /run 触发
-        /api/callback 回调
-        /api/registry 心跳
-      API 与 UI
-        管理 API
-        控制台大盘
-    核心机制
-      Redis 选主
-        SETNX 原子抢锁
-        Lua 值校验续期
-        防双主脑裂
-      写收敛 Leader
-        307 重定向
-        写前校验锁
-      回调闭环
-        先落库拿 logId
-        按 logId 幂等回填
-      确定性执行 ID
-        jobID 与 slot
-        执行日志关联
-      故障转移
-        新 Leader 重载
-        错过即重排
-    启动方式
-      Docker Compose
-      源码启动
-      种子任务
-      控制台 UI
+flowchart TD
+    root((NanoJob 分布式调度引擎))
+
+    root --> loc
+    loc["定位"] --> loc1["分布式任务调度"]
+    loc --> loc2["XXL-Job 协议兼容"]
+    loc --> loc3["学习型项目"]
+
+    root --> tech
+    tech["技术栈"] --> tech1["Go 1.26+"]
+    tech --> tech2["MySQL 存储"]
+    tech --> tech3["Redis 协调"]
+    tech --> tech4["xxl-job-core 执行器"]
+
+    root --> layer
+    layer["架构分层"] --> l1["存储层"]
+    l1 --> l1a["MySQL：任务 / 触发 / 日志"]
+    l1 --> l1b["Redis：选主锁 / 注册表"]
+    layer --> l2["调度内核"]
+    l2 --> l2a["时间轮 1s 滴答 × 60 槽"]
+    l2 --> l2b["Cron 解析器"]
+    l2 --> l2c["单目标路由"]
+    layer --> l3["选举与注册"]
+    l3 --> l3a["SETNX + TTL 选主"]
+    l3 --> l3b["心跳 TTL 注册表"]
+    layer --> l4["协议层"]
+    l4 --> l4a["/run 触发"]
+    l4 --> l4b["/api/callback 回调"]
+    l4 --> l4c["/api/registry 心跳"]
+    layer --> l5["API 与 UI"]
+    l5 --> l5a["管理 API"]
+    l5 --> l5b["控制台大盘"]
+
+    root --> core
+    core["核心机制"] --> c1["Redis 选主"]
+    c1 --> c1a["SETNX 原子抢锁"]
+    c1 --> c1b["Lua 值校验续期"]
+    c1 --> c1c["防双主脑裂"]
+    core --> c2["写收敛 Leader"]
+    c2 --> c2a["307 重定向"]
+    c2 --> c2b["写前校验锁"]
+    core --> c3["回调闭环"]
+    c3 --> c3a["先落库拿 logId"]
+    c3 --> c3b["按 logId 幂等回填"]
+    core --> c4["确定性执行 ID"]
+    c4 --> c4a["jobID 与 slot"]
+    c4 --> c4b["执行日志关联"]
+    core --> c5["故障转移"]
+    c5 --> c5a["新 Leader 重载"]
+    c5 --> c5b["错过即重排"]
+
+    root --> start
+    start["启动方式"] --> st1["Docker Compose"]
+    start --> st2["源码启动"]
+    start --> st3["种子任务"]
+    start --> st4["控制台 UI"]
 ```
 
 ## 架构

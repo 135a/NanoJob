@@ -24,57 +24,62 @@ A distributed job scheduling engine written in **Go**, backed by **MySQL + Redis
 ## Project mind map
 
 ```mermaid
-mindmap
-  root((NanoJob scheduling engine))
-    What it is
-      Distributed job scheduling
-      XXL-Job protocol compatible
-      Learning project
-    Tech stack
-      Go 1.26+
-      MySQL storage
-      Redis coordination
-      xxl-job-core executors
-    Architecture
-      Storage layer
-        MySQL jobs triggers logs
-        Redis election lock + registry
-      Scheduling core
-        1s tick 60 slots
-        Cron parser
-        Single-target router
-      Election and registry
-        SETNX + TTL election
-        Heartbeat TTL registry
-      Protocol layer
-        /run trigger
-        /api/callback callback
-        /api/registry heartbeat
-      API and UI
-        Admin API
-        Dashboard
-    Core mechanisms
-      Redis leader election
-        Atomic SETNX lock
-        Lua value-check renewal
-        No split-brain
-      Write convergence
-        307 redirect
-        VerifyLeadership before write
-      Callback loop
-        Insert log first, get logId
-        Idempotent backfill by logId
-      Deterministic exec ID
-        jobID and slot
-        Atomic dedup in Java
-      Failover
-        New leader reloads
-        Skip missed, reschedule now
-    How to start
-      Docker Compose
-      Run from source
-      Seed job
-      Dashboard UI
+flowchart TD
+    root((NanoJob scheduling engine))
+
+    root --> loc
+    loc["What it is"] --> loc1["Distributed job scheduling"]
+    loc --> loc2["XXL-Job protocol compatible"]
+    loc --> loc3["Learning project"]
+
+    root --> tech
+    tech["Tech stack"] --> tech1["Go 1.26+"]
+    tech --> tech2["MySQL storage"]
+    tech --> tech3["Redis coordination"]
+    tech --> tech4["xxl-job-core executors"]
+
+    root --> layer
+    layer["Architecture"] --> l1["Storage layer"]
+    l1 --> l1a["MySQL: jobs / triggers / logs"]
+    l1 --> l1b["Redis: election lock + registry"]
+    layer --> l2["Scheduling core"]
+    l2 --> l2a["1s tick × 60 slots"]
+    l2 --> l2b["Cron parser"]
+    l2 --> l2c["Single-target router"]
+    layer --> l3["Election and registry"]
+    l3 --> l3a["SETNX + TTL election"]
+    l3 --> l3b["Heartbeat TTL registry"]
+    layer --> l4["Protocol layer"]
+    l4 --> l4a["/run trigger"]
+    l4 --> l4b["/api/callback callback"]
+    l4 --> l4c["/api/registry heartbeat"]
+    layer --> l5["API and UI"]
+    l5 --> l5a["Admin API"]
+    l5 --> l5b["Dashboard"]
+
+    root --> core
+    core["Core mechanisms"] --> c1["Redis leader election"]
+    c1 --> c1a["Atomic SETNX lock"]
+    c1 --> c1b["Lua value-check renewal"]
+    c1 --> c1c["No split-brain"]
+    core --> c2["Write convergence"]
+    c2 --> c2a["307 redirect"]
+    c2 --> c2b["VerifyLeadership before write"]
+    core --> c3["Callback loop"]
+    c3 --> c3a["Insert log first, get logId"]
+    c3 --> c3b["Idempotent backfill by logId"]
+    core --> c4["Deterministic exec ID"]
+    c4 --> c4a["jobID and slot"]
+    c4 --> c4b["Execution log correlation"]
+    core --> c5["Failover"]
+    c5 --> c5a["New leader reloads"]
+    c5 --> c5b["Skip missed, reschedule now"]
+
+    root --> start
+    start["How to start"] --> st1["Docker Compose"]
+    start --> st2["Run from source"]
+    start --> st3["Seed job"]
+    start --> st4["Dashboard UI"]
 ```
 
 ## Architecture
