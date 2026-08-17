@@ -226,11 +226,12 @@ func TestRenewDetectsStolenLock(t *testing.T) {
 	}
 }
 
-// TestRenewErrorKeepsMaster 契约: 续期遇到 Redis 连接错误只返回错误、不降级。
-// 设计取舍: Redis 不可达时谁也抢不到锁 (SetNX 同样连不上), 不会产生两个"可验证的主";
-// 瞬时抖动不触发选主翻转, Redis 恢复后下一次续期由 res==-1 检查自动收敛。
-// 真正需要降级的是"锁被抢走/过期" (res==-1), 见 TestRenewDetectsStolenLock。
-func TestRenewErrorKeepsMaster(t *testing.T) {
+// TestRenewErrorStepsDown 契约: 续期遇到 Redis 连接错误必须降级。
+// 无法区分 "Redis 宕机 (谁也连不上)" 与 "网络分区 (只有本节点连不上)"。
+// 网络分区下 Standby 仍能连上 Redis, 在 TTL 到期后抢锁上位;
+// 若旧主因续期报错而不降级, 就会出现两台引擎同时派发 = 双主脑裂 (issue #10)。
+// 保守降级是 fail-safe: 即便真是 Redis 宕机, 恢复后节点会重新参与竞选。
+func TestRenewErrorStepsDown(t *testing.T) {
 	srv, err := miniredis.Run()
 	if err != nil {
 		t.Fatal(err)
@@ -238,13 +239,22 @@ func TestRenewErrorKeepsMaster(t *testing.T) {
 
 	e := newTestElection(srv, "A", 5*time.Second)
 	mustAcquire(t, e)
+	drainChanges(e)
 
 	srv.Close() // 模拟 Redis 宕机/网络分区: 之后所有命令报错
 	if err := e.renew(); err == nil {
 		t.Fatal("预期 renew 报错 (Redis 已断), 实际返回 nil")
 	}
-	if !e.IsMaster() {
-		t.Fatal("瞬时续期错误不应触发选主翻转: 应保持主, 待 Redis 恢复后由 res==-1 收敛")
+	if e.IsMaster() {
+		t.Fatal("续期遇到连接错误必须降级, 否则网络分区下与接管的新主双主脑裂")
+	}
+	select {
+	case v := <-e.changes:
+		if v {
+			t.Fatal("让位应广播 false")
+		}
+	default:
+		t.Fatal("降级后应广播让位事件")
 	}
 }
 

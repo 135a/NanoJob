@@ -78,12 +78,18 @@ func (e *Election) LoopInElect(ctx context.Context, errCh chan<- error) error {
 	}
 }
 
-// renew 续期; 若锁已丢则降级并广播。
+// renew 续期; 锁已丢 (res==-1) 或 Redis 不可达 (err!=nil) 都降级并广播。
 func (e *Election) renew() error {
 	res, err := renewScript.Run(context.Background(), e.redis, []string{e.key},
 		e.nodeID, int64(e.ttl/time.Millisecond)).Int()
 	if err != nil {
-		return fmt.Errorf("选举锁续期失败: %v", err)
+		// Redis 断连/超时: 无法确认锁归属。可能是 Redis 宕机 (谁也连不上),
+		// 也可能是网络分区 (只有本节点连不上, Standby 仍能连上并在 TTL 到期后抢锁上位)。
+		// 两者无法区分, 必须保守降级 —— 否则网络分区下旧主继续派发、新主也已上位 = 双主脑裂。
+		// 降级是 fail-safe: 即便真是 Redis 宕机, 恢复后节点会重新参与竞选。
+		e.isMaster.Store(false)
+		e.notify(false)
+		return fmt.Errorf("选举锁续期失败, 已降级为 Standby: %v", err)
 	}
 	if res == -1 {
 		// 锁已被他人拿走或已过期 —— 立即降级, 让调度协程停轮子
