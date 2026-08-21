@@ -340,9 +340,9 @@
         // 写请求 (POST) 落在 Standby 时, 引擎会 307 重定向到 Leader, fetch 默认自动跟随。
         // 本地三引擎演示: 9090/9091/9092; docker 三引擎: localhost:8081/8082/8083。
         const API_ENGINES = [
-            'http://localhost:8080',
-            'http://localhost:8081',
-            'http://localhost:8082',
+            'http://localhost:8401',
+            'http://localhost:8402',
+            'http://localhost:8403',
         ];
 
         function setEngineStatus(text) {

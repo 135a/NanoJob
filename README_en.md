@@ -9,6 +9,10 @@ A distributed job scheduling engine written in **Go**, backed by **MySQL + Redis
   <img src="https://img.shields.io/badge/Compatibility-XXL--Job-important.svg" alt="XXL-Job">
 </p>
 
+<p align="center">
+  🎬 Demo video (Chinese): <a href="https://b23.tv/teLCude">【个人项目-go语言调度中心】on Bilibili</a>
+</p>
+
 > **Status: learning project.** Built to study distributed scheduling, Redis leader election, write convergence, and fault tolerance. Storage (MySQL/Redis) is single-instance; app-layer engines are HA replicas.
 
 ## Overview
@@ -131,7 +135,7 @@ Config is driven by `conf.json`; these variables **override** key fields (docker
 docker-compose up -d
 ```
 
-Brings up MySQL (3306), Redis (6379), and three Go engines (8081/8082/8083). Stop any engine and the others re-elect a Leader — watch the failover logs.
+Brings up MySQL (3306), Redis (6379), and three Go engines (host mapping `8401/8402/8403` for the app-internal 8080). Stop any engine and the others re-elect a Leader — watch the failover logs. Note: host ports use `84xx` because `8081~8083` collide with a Windows reserved port range (e.g. Hyper-V/winnat excludes `7991-8090`). If you hit a `bind: ... access permissions` error, run `netsh int ipv4 show excludedportrange protocol=tcp` to find the excluded ranges and pick a free port outside them.
 
 > Engines talk to each other via container service names (`nanojob1:8080`). To exercise the browser redirect, set `NANOJOB_ADVERTISE_ADDR` to a `localhost:<mapped-port>` address.
 
@@ -159,3 +163,26 @@ go run ./cmd/seed/main.go     # inserts a job that fires every 10 seconds
 Open `ui/index.html` directly in a browser (talks to the engines over CORS). Shows each job's next-fire-time and execution logs.
 
 The frontend lists **all engine addresses** in the `API_ENGINES` array at the top of `ui/index.html` and tries them in order: if the current engine dies it fails over to the next one automatically (ordered retry, not random). Writes landing on a Standby are 307-redirected to the Leader and `fetch` follows. The header status bar shows which engine is currently connected — kill an engine and refresh to watch the failover.
+
+## Background & problems solved: vs. Java XXL-Job
+
+NanoJob isn't just another XXL-Job. It's a scheduling engine rewritten from scratch in Go to address several pain points of the Java-based XXL-Job. It **keeps XXL-Job's executor protocol, but swaps out the scheduler-center implementation**. The table below contrasts the two:
+
+| Aspect | Java XXL-Job | What NanoJob solves relative to it |
+| :--- | :--- | :--- |
+| **Scheduling driver** | The Admin is a Spring Boot app whose scheduler thread **polls/queries the DB** to fetch due jobs; the hot path depends on the DB | Drives triggers with an **in-memory time wheel (1s tick × 60 slots)**, so runtime scheduling never polls the DB; MySQL only stores jobs / next-fire / logs as a "memory" for crash recovery |
+| **Deployment shape** | Depends on the JVM + full Spring Boot stack; big footprint, slow startup | Compiles to a **single static binary** with no external runtime — fast start/stop, low resource usage, suited to containers/edge |
+| **Scheduler high-availability** | The Admin itself is a **single point**; HA requires deploying an *extra* Admin cluster | Scheduling engines are **naturally multi-replica**: Redis `SETNX`+TTL elects a single Leader and takes over automatically on crash — master/backup HA is built in, no extra cluster |
+| **Split-brain protection** | — | Lock acquisition is atomic in one step; **renewal uses a Lua value check** (only renew if the key still holds you), and a failed/uncertain renew means **stepping down**. This isolates a class of bugs like the etcd one, preventing two masters from firing together → "run exactly once" |
+| **Write convergence** | Writes hit the Admin directly | A Standby that receives a write **307-redirects to the Leader**, so config/trigger mutations converge on one node and never race |
+| **Executor migration cost** | Downstream is Java executors | `/run`, `/api/callback`, `/api/registry` are **XXL-Job protocol compatible**, so existing `xxl-job-core` executors can be reused as-is — **replace only the scheduler side, zero executor migration** |
+
+### Deliberate trade-offs (non-goals vs. XXL-Job)
+
+NanoJob is a learning project — it cuts XXL-Job's peripheral features for readable internals and predictable behavior:
+
+- **No misfire compensation**: a missed trigger is not backfilled; it's rescheduled from the current time, so behavior is predictable;
+- **No failure-retry / broadcast-sharding strategies**: routing is a simple single-target `PickOne`;
+- **Storage (MySQL/Redis) stays single-instance**: HA only covers the scheduling engines; storage HA is a future direction.
+
+In one sentence: **NanoJob answers "how to make distributed scheduled tasks highly available and run each one exactly once" with the smallest stack (Go + MySQL + Redis) — using the XXL-Job protocol as the compat layer and an in-memory time wheel + Redis election as the core, for a lighter deployment and self-contained HA than the Java version.**

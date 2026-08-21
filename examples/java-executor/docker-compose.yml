@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  java-executor:
+    build: .
+    container_name: java-executor
+    # 与 Go 引擎共享同一网络,保证：
+    #  - 执行器能解析 nanojob1/2/3 并向它们注册
+    #  - 引擎能通过容器内网 IP 反向连到执行器的 9999 Netty 端口
+    networks:
+      - engine_net
+    environment:
+      # admin addresses 可写多台(逗号分隔),执行器会每 30s 注册到所有引擎
+      # 也可只写一台,引擎之间天然已知彼此(集群内共享注册表)
+      - XXL_JOB_ADMIN_ADDRESSES=http://nanojob1:8080,http://nanojob2:8080,http://nanojob3:8080
+    # 宿主侧端口挑到 Windows 预留段(7991-8090 等)之外,容器内端口不动
+    ports:
+      - "8405:8081"  # Spring Web
+      - "9405:9999"  # XXL-Job Netty 通信端口(引擎回调)
+    restart: unless-stopped
+
+# 复用引擎 compose 创建的网络(由 D:\NanoJob\docker-compose.yml 生成,名 = nanojob_default)
+# external 网络必须已存在,故先起引擎再起本文件
+networks:
+  engine_net:
+    external:
+      name: nanojob_default

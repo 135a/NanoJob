@@ -48,7 +48,7 @@ services:
       - NANOJOB_REDIS_ADDR=redis:6379
       - NANOJOB_ADVERTISE_ADDR=http://nanojob1:8080
     ports:
-      - "8081:8080"
+      - "8401:8080"
 
   nanojob2:
     build: .
@@ -63,7 +63,7 @@ services:
       - NANOJOB_REDIS_ADDR=redis:6379
       - NANOJOB_ADVERTISE_ADDR=http://nanojob2:8080
     ports:
-      - "8082:8080"
+      - "8402:8080"
 
   nanojob3:
     build: .
@@ -78,7 +78,8 @@ services:
       - NANOJOB_REDIS_ADDR=redis:6379
       - NANOJOB_ADVERTISE_ADDR=http://nanojob3:8080
     ports:
-      - "8083:8080"
+      # 宿主侧映射避开 Windows 排除端口段: 8081/8082/8083 会被 Hyper-V/winnat 预留 (7991-8090) 导致绑定失败
+      - "8403:8080"
 
 volumes:
   mysql-data:
