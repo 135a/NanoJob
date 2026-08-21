@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-// Task 代表挂载在时间轮上的一个定时任务
+// Task 挂载在时间轮上的一个定时任务
 type Task struct {
-	ID       string // 任务的唯一标识
-	Circle   int    // 重点：剩余的圈数
-	Execute  func() // 任务触发时真正要执行的回调函数
+	ID      string
+	Circle  int    // 剩余圈数: 降到 0 才触发
+	Execute func() // 触发时执行的回调
 }
 
 type TimeWheel struct {
@@ -44,16 +44,11 @@ func (tw *TimeWheel) AddTask(delay time.Duration, id string, execute func()) {
 	tw.mutex.Lock()
 	defer tw.mutex.Unlock()
 
-	// 1. 计算总共需要多少个“滴答”
+	// 总滴答数 → 圈数 → 最终槽位 (当前位置 + 余数)
 	ticks := int(delay / tw.interval)
-	
-	// 2. 计算需要转几圈
 	circle := ticks / tw.slotNum
-	
-	// 3. 计算应该落在哪一个槽位 (当前位置 + 余数)
 	pos := (tw.current + ticks) % tw.slotNum
 
-	// 4. 构建任务并放入对应的槽位
 	task := &Task{
 		ID:      id,
 		Circle:  circle,
@@ -82,23 +77,17 @@ func (tw *TimeWheel) tickHandler() {
 	tasks := tw.slots[tw.current]
 	var remainingTasks []*Task
 
-	// 遍历当前槽位的所有任务
 	for _, task := range tasks {
 		if task.Circle > 0 {
-			// 如果圈数没走完，圈数减1，继续留在槽位里等待下一圈
-			task.Circle--
+			task.Circle-- // 圈数未走完, 继续留在槽位等待下一圈
 			remainingTasks = append(remainingTasks, task)
 		} else {
-			// 如果圈数为 0，说明时间到了，立刻异步执行任务！
-			go task.Execute()
+			go task.Execute() // 圈数为 0, 时间到, 异步执行
 		}
 	}
 
-	// 更新当前槽位（剔除掉已经执行的任务）
-	tw.slots[tw.current] = remainingTasks
-	
-	// 指针往前走一格
-	tw.current = (tw.current + 1) % tw.slotNum
+	tw.slots[tw.current] = remainingTasks      // 剔除已执行任务后回填
+	tw.current = (tw.current + 1) % tw.slotNum // 指针前移一格
 }
 
 // Stop 停止时间轮

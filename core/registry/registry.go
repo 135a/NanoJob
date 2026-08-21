@@ -20,9 +20,9 @@ func Init(client *redis.Client) {
 
 // RegistryParam XXL-Job 客户端心跳上报的 JSON 请求格式
 type RegistryParam struct {
-	RegistryGroup string `json:"registryGroup"` // 通常是 "EXECUTOR"
-	RegistryKey   string `json:"registryKey"`   // 应用名, 比如 "loan-service"
-	RegistryValue string `json:"registryValue"` // 节点的 IP:Port (如 192.168.1.100:9999)
+	RegistryGroup string `json:"registryGroup"` // 组, 通常为 "EXECUTOR"
+	RegistryKey   string `json:"registryKey"`   // 应用名, 如 "loan-service"
+	RegistryValue string `json:"registryValue"` // 节点地址 IP:Port
 }
 
 const (

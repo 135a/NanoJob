@@ -17,13 +17,8 @@ import (
 )
 
 // Scheduler 调度核心: 把任务装进时间轮, 到点派发并落执行日志。
-// 只在 Leader 上运行 —— 由外部按选举结果调用 Start/Stop。
-//
-// 相比旧版的 etcd-Watch 统一消费:
-//   - 写请求收敛到 Leader 后, 新增任务由本进程直接挂轮子, 不再有"写回→自消费"回环,
-//     因此 inWheel/lastFired/skipDedup 三层去重可以整个删掉 (think.md 砍#4)。
-//   - mu + ready 只用来消除"领导权交接瞬间同一任务被挂载两次"的竞态
-//     (AddJob 的"建+排" 与 Start 的"全量加载"互斥)。
+// 只在 Leader 上运行, 由外部按选举结果调用 Start/Stop。
+// mu + ready 用于消除交接瞬间同一任务被重复挂载的竞态。
 type Scheduler struct {
 	store    store.Store
 	parser   *parser.CronParser
@@ -45,8 +40,7 @@ func New(store store.Store, parser *parser.CronParser, interval time.Duration, s
 	}
 }
 
-// Start 上位: 全新时间轮 + 加载全量任务。与 AddJob 的"建+排"互斥,
-// 从根上消除交接瞬间重复挂载。
+// Start 上位: 全新时间轮 + 加载全量任务, 与 AddJob 的"建+排"互斥防重复挂载。
 func (s *Scheduler) Start(ctx context.Context) error {
 	s.mu.Lock()
 	s.tw = timewheel.New(s.interval, s.slotNum)
@@ -57,8 +51,8 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	return s.LoadAndSchedule(ctx)
 }
 
-// Stop 让位: 停时间轮。已排队但未到点的任务丢弃, 由新 Leader 重新加载。
-// 已在派发途中的 fireOnce 异步 goroutine 会跑完, 回调仍会按 logId 回填日志。
+// Stop 让位: 停时间轮。已排队未到点的任务丢弃, 由新 Leader 重新加载;
+// 已在派发途中的 fireOnce 异步 goroutine 会跑完, 回调仍按 logId 回填日志。
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -92,6 +86,7 @@ func (s *Scheduler) AddJob(ctx context.Context, job *store.JobInfo) (int64, erro
 	defer s.mu.Unlock()
 
 	if !s.ready || s.tw == nil {
+		
 		return s.store.CreateJob(ctx, job)
 	}
 	id, err := s.store.CreateJob(ctx, job)
